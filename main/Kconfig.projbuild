@@ -6,6 +6,93 @@ config OTA_URL
     help
         The application will access this URL to check for new firmwares and server address.
 
+menu "Voice Lab Adapter"
+
+config VOICE_LAB_AUTO_CONNECT
+    bool "Auto-connect Voice Lab after network is connected"
+    default y
+    help
+        Connect to Voice Lab automatically after WiFi or cellular networking is ready.
+        The firmware uses VOICE_LAB_SERVER_HOST, VOICE_LAB_SERVER_PORT and
+        VOICE_LAB_SERVER_TLS to build the device control/audio websocket paths.
+
+config VOICE_LAB_SERVER_HOST
+    string "Voice Lab server host"
+    default "voice-lab.cloud"
+    help
+        Voice Lab server hostname or IP address. Production uses voice-lab.cloud.
+
+config VOICE_LAB_SERVER_PORT
+    int "Voice Lab server port"
+    default 1883
+    range 1 65535
+    help
+        Voice Lab server port. Production currently uses 1883 with HTTPS/WSS.
+        Explicit no-TLS IP debugging
+        can use 18100.
+
+config VOICE_LAB_SERVER_TLS
+    bool "Use TLS for Voice Lab HTTP/WebSocket"
+    default y
+    help
+        When enabled, the ESP32 uses HTTPS/WSS and certificate validation.
+        When disabled, it uses HTTP/WS for explicit IP debugging only.
+        The protocol is selected by this flag, not inferred from the port.
+
+config VOICE_LAB_SERVER_URL
+    string "Legacy Voice Lab server URL override"
+    default ""
+    help
+        Legacy compatibility override. Leave empty for the split host/port/TLS
+        configuration above. The ESP32 builds websocket endpoints as:
+        /api/v1/devices/{device_key}/control
+        /api/v1/devices/{device_key}/audio
+
+config VOICE_LAB_DEVICE_KEY
+    string "Default Voice Lab device key"
+    default ""
+    help
+        Optional fixed Voice Lab device key. If empty, the ESP32 derives one
+        from the WiFi MAC address as waveshare-esp32s3-audio-xxxxxxxxxxxx.
+
+config VOICE_LAB_DEVICE_TOKEN
+    string "Default Voice Lab device token"
+    default ""
+    help
+        Optional authorization token for Voice Lab device endpoints. Do not commit
+        real secrets. It can be overridden at runtime with self.voice_lab.configure.
+
+config VOICE_LAB_HARDWARE_PROFILE
+    string "Voice Lab hardware profile"
+    default "waveshare-esp32s3-audio-board"
+    help
+        Hardware profile reported in the Voice Lab hello message. This must
+        match the device record created in the Voice Lab console.
+
+config VOICE_LAB_AUDIO_FRONTEND
+    string "Voice Lab audio frontend"
+    default "waveshare-es7210"
+    help
+        Audio frontend identity reported in the Voice Lab hello message.
+
+config VOICE_LAB_SUPPRESS_XIAOZHI_ACTIVATION
+    bool "Suppress Xiaozhi cloud activation prompt while using Voice Lab"
+    default y
+    help
+        Skip the original Xiaozhi cloud activation QR/code prompt and spoken digit
+        playback when this firmware is being used as a Voice Lab adapter.
+
+config VOICE_LAB_STANDALONE_MODE
+    bool "Run as a standalone Voice Lab adapter"
+    default y
+    help
+        Keep the first-stage Voice Lab path independent from the Xiaozhi cloud
+        protocol. When enabled, the firmware skips Xiaozhi cloud version
+        activation/protocol startup and does not play the activation-complete
+        sound after networking is ready.
+
+endmenu
+
 choice
     prompt "Flash Assets"
     default FLASH_DEFAULT_ASSETS if !USE_EMOTE_MESSAGE_STYLE

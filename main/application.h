@@ -117,6 +117,8 @@ public:
     void SetAecMode(AecMode mode);
     AecMode GetAecMode() const { return aec_mode_; }
     void PlaySound(const std::string_view& sound);
+    bool StartVoiceLabPlayback(const std::string& audio_url);
+    void StopVoiceLabPlayback();
     AudioService& GetAudioService() { return audio_service_; }
     
     /**

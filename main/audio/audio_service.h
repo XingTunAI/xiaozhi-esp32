@@ -29,6 +29,7 @@
  * There are two types of audio data flow:
  * 1. (MIC) -> [Audio Engine] -> {Encode Queue} -> [Opus Encoder] -> {Send Queue} -> (Server)
  * 2. (Server) -> {Decode Queue} -> [Opus Decoder] -> {Playback Queue} -> (Speaker)
+ * 3. (MIC) -> (External capture callback)
  *
  * We use dedicated tasks for input, output, and Opus encoding/decoding.
  * 
@@ -37,6 +38,7 @@
  */
 
 #define OPUS_FRAME_DURATION_MS 60
+#define EXTERNAL_CAPTURE_FRAME_DURATION_MS 20
 #define MAX_ENCODE_TASKS_IN_QUEUE 2
 #define MAX_PLAYBACK_TASKS_IN_QUEUE 2
 #define MAX_DECODE_PACKETS_IN_QUEUE (1200 / OPUS_FRAME_DURATION_MS)
@@ -50,6 +52,7 @@
 #define AS_EVENT_AUDIO_TESTING_RUNNING      (1 << 0)
 #define AS_EVENT_WAKE_WORD_RUNNING          (1 << 1)
 #define AS_EVENT_AUDIO_PROCESSOR_RUNNING    (1 << 2)
+#define AS_EVENT_EXTERNAL_CAPTURE_RUNNING   (1 << 3)
 #define AS_EVENT_AUDIO_INPUT_STOP_REQUEST   (1 << 4)
 
 #define AS_OPUS_GET_FRAME_DRU_ENUM(duration_ms)                   \
@@ -83,6 +86,7 @@ struct AudioServiceCallbacks {
     // Fired when the decode/playback queues and their in-flight work are drained.
     std::function<void(void)> on_playback_drained;
     std::function<void(uint32_t playback_id, uint32_t media_position_ms)> on_playback_progress;
+    std::function<void(std::vector<int16_t>&& pcm)> on_external_capture_audio;
 };
 
 
@@ -130,6 +134,7 @@ public:
     void ReleaseWakeWordResources();
     void EnableVoiceProcessing(bool enable);
     void EnableAudioTesting(bool enable);
+    void EnableExternalCapture(bool enable);
     void EnableDeviceAec(bool enable);
 
     void SetCallbacks(AudioServiceCallbacks& callbacks);

@@ -9,6 +9,7 @@
 #include "settings.h"
 #include "system_info.h"
 #include "text_glyph_payload.h"
+#include "voice_lab_client.h"
 #include "websocket_protocol.h"
 
 #include <driver/gpio.h>
@@ -19,6 +20,14 @@
 #include <limits>
 
 #define TAG "Application"
+
+#ifndef CONFIG_VOICE_LAB_SUPPRESS_XIAOZHI_ACTIVATION
+#define CONFIG_VOICE_LAB_SUPPRESS_XIAOZHI_ACTIVATION 1
+#endif
+
+#ifndef CONFIG_VOICE_LAB_STANDALONE_MODE
+#define CONFIG_VOICE_LAB_STANDALONE_MODE 1
+#endif
 
 Application::Application() : notify_player_(audio_service_) {
     event_group_ = xEventGroupCreate();
@@ -88,6 +97,9 @@ void Application::Initialize() {
     callbacks.on_playback_progress = [this](uint32_t playback_id, uint32_t media_position_ms) {
         notify_player_.OnPlaybackProgress(playback_id, media_position_ms);
     };
+    callbacks.on_external_capture_audio = [](std::vector<int16_t>&& pcm) {
+        VoiceLabClient::GetInstance().SendPcmAudio(std::move(pcm));
+    };
     audio_service_.SetCallbacks(callbacks);
 
     // Add state change listeners
@@ -102,6 +114,7 @@ void Application::Initialize() {
     auto& mcp_server = McpServer::GetInstance();
     mcp_server.AddCommonTools();
     mcp_server.AddUserOnlyTools();
+    VoiceLabClient::GetInstance().RegisterMcpTools();
 
     // Set network event callback for UI updates and network state handling
     board.SetNetworkEventCallback([this](NetworkEvent event, const std::string& data) {
@@ -285,6 +298,7 @@ void Application::Run() {
 
 void Application::HandleNetworkConnectedEvent() {
     ESP_LOGI(TAG, "Network connected");
+    VoiceLabClient::GetInstance().ConnectAsync();
     auto state = GetDeviceState();
 
     if (state == kDeviceStateStarting || state == kDeviceStateWifiConfiguring) {
@@ -311,6 +325,8 @@ void Application::HandleNetworkConnectedEvent() {
 }
 
 void Application::HandleNetworkDisconnectedEvent() {
+    VoiceLabClient::GetInstance().Disconnect();
+
     // Close current conversation when network disconnected
     auto state = GetDeviceState();
     if (state == kDeviceStateNotifying) {
@@ -335,6 +351,13 @@ void Application::HandleActivationDoneEvent() {
 
     has_server_time_ = ota_->HasServerTime();
 
+#if CONFIG_VOICE_LAB_STANDALONE_MODE
+    auto display = Board::GetInstance().GetDisplay();
+    display->SetChatMessage("system", "");
+    ota_.reset();
+    auto& board = Board::GetInstance();
+    board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+#else
     auto display = Board::GetInstance().GetDisplay();
     std::string message = std::string(Lang::Strings::VERSION) + ota_->GetCurrentVersion();
     display->ShowNotification(message.c_str());
@@ -349,6 +372,7 @@ void Application::HandleActivationDoneEvent() {
         // Play the success sound to indicate the device is ready
         audio_service_.PlaySound(Lang::Sounds::OGG_SUCCESS);
     });
+#endif
 }
 
 void Application::ActivationTask() {
@@ -358,11 +382,15 @@ void Application::ActivationTask() {
     // Check for new assets version
     CheckAssetsVersion();
 
+#if CONFIG_VOICE_LAB_STANDALONE_MODE
+    ESP_LOGI(TAG, "Skipping Xiaozhi cloud protocol startup in Voice Lab standalone mode");
+#else
     // Check for new firmware version
     CheckNewVersion();
 
     // Initialize the protocol
     InitializeProtocol();
+#endif
 
     // Signal completion to main loop
     xEventGroupSetBits(event_group_, MAIN_EVENT_ACTIVATION_DONE);
@@ -492,6 +520,11 @@ void Application::CheckNewVersion() {
             // Exit the loop if done checking new version
             break;
         }
+
+#if CONFIG_VOICE_LAB_SUPPRESS_XIAOZHI_ACTIVATION
+        ESP_LOGW(TAG, "Suppressing Xiaozhi cloud activation prompt in Voice Lab adapter mode");
+        break;
+#endif
 
         display->SetStatus(Lang::Strings::ACTIVATION);
         // Activation code is shown to the user and waiting for the user to input
@@ -1336,6 +1369,26 @@ void Application::SetAecMode(AecMode mode) {
 }
 
 void Application::PlaySound(const std::string_view& sound) { audio_service_.PlaySound(sound); }
+
+bool Application::StartVoiceLabPlayback(const std::string& audio_url) {
+    if (audio_url.empty()) {
+        return false;
+    }
+    Schedule([this, audio_url]() {
+        StartNotification(audio_url, {});
+    });
+    return true;
+}
+
+void Application::StopVoiceLabPlayback() {
+    Schedule([this]() {
+        if (GetDeviceState() == kDeviceStateNotifying) {
+            StopNotification();
+        } else {
+            audio_service_.ResetDecoder();
+        }
+    });
+}
 
 void Application::ResetProtocol() {
     Schedule([this]() {

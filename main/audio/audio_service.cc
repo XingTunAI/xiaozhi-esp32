@@ -1,5 +1,6 @@
 #include "audio_service.h"
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <cstring>
 
 #define RATE_CVT_CFG(_src_rate, _dest_rate, _channel)        \
@@ -122,7 +123,8 @@ void AudioService::Initialize(AudioCodec* codec) {
 void AudioService::Start() {
     service_stopped_.store(false);
     xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING | AS_EVENT_WAKE_WORD_RUNNING |
-        AS_EVENT_AUDIO_PROCESSOR_RUNNING | AS_EVENT_AUDIO_INPUT_STOP_REQUEST);
+        AS_EVENT_AUDIO_PROCESSOR_RUNNING | AS_EVENT_EXTERNAL_CAPTURE_RUNNING |
+        AS_EVENT_AUDIO_INPUT_STOP_REQUEST);
 
     esp_timer_start_periodic(audio_power_timer_, 1000000);
 
@@ -169,7 +171,8 @@ void AudioService::Stop() {
     service_stopped_.store(true);
     xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING |
         AS_EVENT_WAKE_WORD_RUNNING |
-        AS_EVENT_AUDIO_PROCESSOR_RUNNING);
+        AS_EVENT_AUDIO_PROCESSOR_RUNNING |
+        AS_EVENT_EXTERNAL_CAPTURE_RUNNING);
 
     bool notify_drained = false;
     {
@@ -235,7 +238,12 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
 
 void AudioService::AudioInputTask() {
     constexpr EventBits_t kAudioInputActiveBits = AS_EVENT_AUDIO_TESTING_RUNNING |
-        AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING;
+        AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING |
+        AS_EVENT_EXTERNAL_CAPTURE_RUNNING;
+    uint32_t external_capture_read_ok = 0;
+    uint32_t external_capture_read_fail = 0;
+    uint32_t external_capture_callback_missing = 0;
+    int64_t last_external_capture_stats_us = 0;
 
     while (true) {
         EventBits_t bits = xEventGroupWaitBits(event_group_, kAudioInputActiveBits |
@@ -291,6 +299,44 @@ void AudioService::AudioInputTask() {
                 }
                 PushTaskToEncodeQueue(kAudioTaskTypeEncodeToTestingQueue, std::move(data));
                 continue;
+            }
+        }
+
+        if (bits & AS_EVENT_EXTERNAL_CAPTURE_RUNNING) {
+            std::vector<int16_t> data;
+            int samples = EXTERNAL_CAPTURE_FRAME_DURATION_MS * 16000 / 1000;
+            if (ReadAudioData(data, 16000, samples)) {
+                ++external_capture_read_ok;
+                if (codec_->input_channels() > 1) {
+                    auto channels = codec_->input_channels();
+                    auto mono_data = std::vector<int16_t>(data.size() / channels);
+                    for (size_t i = 0, j = 0; i < mono_data.size(); ++i, j += channels) {
+                        mono_data[i] = data[j];
+                    }
+                    data = std::move(mono_data);
+                }
+                if (callbacks_.on_external_capture_audio) {
+                    callbacks_.on_external_capture_audio(std::move(data));
+                } else {
+                    ++external_capture_callback_missing;
+                }
+                auto now_us = esp_timer_get_time();
+                if (now_us - last_external_capture_stats_us >= 1000000) {
+                    ESP_LOGI(TAG, "External capture stats: read_ok=%u read_fail=%u callback_missing=%u",
+                             external_capture_read_ok, external_capture_read_fail,
+                             external_capture_callback_missing);
+                    last_external_capture_stats_us = now_us;
+                }
+                continue;
+            } else {
+                ++external_capture_read_fail;
+                auto now_us = esp_timer_get_time();
+                if (now_us - last_external_capture_stats_us >= 1000000) {
+                    ESP_LOGW(TAG, "External capture stats: read_ok=%u read_fail=%u callback_missing=%u",
+                             external_capture_read_ok, external_capture_read_fail,
+                             external_capture_callback_missing);
+                    last_external_capture_stats_us = now_us;
+                }
             }
         }
 
@@ -722,6 +768,17 @@ void AudioService::EnableAudioTesting(bool enable) {
             playback_drained_notified_ = false;
         }
         audio_queue_cv_.notify_all();
+    }
+}
+
+void AudioService::EnableExternalCapture(bool enable) {
+    ESP_LOGI(TAG, "%s external audio capture", enable ? "Enabling" : "Disabling");
+    if (enable) {
+        xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING |
+            AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING);
+        xEventGroupSetBits(event_group_, AS_EVENT_EXTERNAL_CAPTURE_RUNNING);
+    } else {
+        xEventGroupClearBits(event_group_, AS_EVENT_EXTERNAL_CAPTURE_RUNNING);
     }
 }
 
