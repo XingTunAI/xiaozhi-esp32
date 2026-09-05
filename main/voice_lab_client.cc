@@ -1,7 +1,9 @@
 #include "voice_lab_client.h"
 
 #include "application.h"
+#include "assets/lang_config.h"
 #include "board.h"
+#include "led/circular_strip.h"
 #include "mcp_server.h"
 #include "settings.h"
 #include "system_info.h"
@@ -493,6 +495,7 @@ bool VoiceLabClient::ConnectControlLocked(const std::string& url, const std::str
         recording_.store(false);
         audio_connected_.store(false);
         Application::GetInstance().GetAudioService().EnableExternalCapture(false);
+        SetRecordingIndicator(false);
         if (!manual_disconnect_.load()) {
             ScheduleReconnect();
         }
@@ -556,6 +559,7 @@ bool VoiceLabClient::ConnectAudioLocked(const std::string& url, const std::strin
         audio_connected_.store(false);
         recording_.store(false);
         Application::GetInstance().GetAudioService().EnableExternalCapture(false);
+        SetRecordingIndicator(false);
     });
 
     if (!audio_websocket_->Connect(url.c_str())) {
@@ -814,6 +818,12 @@ bool VoiceLabClient::StartRecording(const std::string& recording_id, const std::
         }
         recording_id_ = recording_id;
         recording_mode_ = mode == "counter_file" ? "counter_file" : "meeting_live";
+        pending_audio_pcm_.clear();
+        audio_sequence_ = 0;
+        sample_start_ = 0;
+        audio_frames_sent_ = 0;
+        audio_bytes_sent_ = 0;
+        last_audio_stats_us_ = 0;
         recording_.store(true);
     }
 
@@ -821,6 +831,8 @@ bool VoiceLabClient::StartRecording(const std::string& recording_id, const std::
     audio_service.EnableVoiceProcessing(false);
     audio_service.EnableWakeWordDetection(false);
     audio_service.EnableExternalCapture(true);
+    SetRecordingIndicator(true);
+    NotifyRecordingStarted();
 
     cJSON* root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "type", "status");
@@ -843,6 +855,7 @@ bool VoiceLabClient::StopRecording() {
 
     auto& audio_service = Application::GetInstance().GetAudioService();
     audio_service.EnableExternalCapture(false);
+    SetRecordingIndicator(false);
     if (Application::GetInstance().GetDeviceState() == kDeviceStateIdle) {
         audio_service.EnableWakeWordDetection(true);
     }
@@ -850,6 +863,9 @@ bool VoiceLabClient::StopRecording() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (audio_websocket_ != nullptr && audio_websocket_->IsConnected()) {
+            while (pending_audio_pcm_.size() >= kPcmSamplesPerFrame &&
+                   FlushPendingAudioLocked(true)) {
+            }
             ESP_LOGI(TAG, "Voice Lab audio end sent");
             audio_websocket_->Send("{\"type\":\"end\"}");
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -883,6 +899,30 @@ void VoiceLabClient::StopPlayback() {
     SendJson("{\"type\":\"event\",\"name\":\"playback_stopped\"}");
 }
 
+void VoiceLabClient::SetRecordingIndicator(bool recording) {
+    auto profile = GetHardwareProfile();
+    if (profile != "waveshare-esp32s3-audio-board" && profile != "esp32-s3-audio-board") {
+        return;
+    }
+
+    auto* led = static_cast<CircularStrip*>(Board::GetInstance().GetLed());
+    if (led == nullptr) {
+        return;
+    }
+
+    // Waveshare's circular WS2812 ring maps the API red/green channels inversely
+    // on this board revision: API red renders physical green, API green renders red.
+    StripColor color = recording ? StripColor{0, 0, 32} : StripColor{32, 0, 0};
+    led->SetAllColor(color);
+}
+
+void VoiceLabClient::NotifyRecordingStarted() {
+    Application::GetInstance().Schedule([]() {
+        Application::GetInstance().Alert("Voice Lab", "开始会议记录", "recording",
+                                         Lang::Sounds::OGG_POPUP);
+    });
+}
+
 bool VoiceLabClient::SendPcmAudio(std::vector<int16_t>&& pcm) {
     if (!recording_.load()) {
         return false;
@@ -893,37 +933,84 @@ bool VoiceLabClient::SendPcmAudio(std::vector<int16_t>&& pcm) {
         return false;
     }
 
-    auto packet = BuildPcmPacket(pcm);
     std::lock_guard<std::mutex> lock(mutex_);
     if (audio_websocket_ == nullptr || !audio_websocket_->IsConnected()) {
         audio_connected_.store(false);
         return false;
     }
+
+    if (!recording_.load()) {
+        return false;
+    }
+    if (pending_audio_pcm_.size() + pcm.size() >
+        static_cast<size_t>(2 * kMaxFramesPerPacket * kPcmSamplesPerFrame)) {
+        ESP_LOGW(TAG, "Voice Lab PCM buffer full; rejecting capture chunk");
+        return false;
+    }
+    pending_audio_pcm_.insert(pending_audio_pcm_.end(), pcm.begin(), pcm.end());
+    while (pending_audio_pcm_.size() >=
+           static_cast<size_t>(kMaxFramesPerPacket * kPcmSamplesPerFrame)) {
+        if (!FlushPendingAudioLocked(false)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool VoiceLabClient::FlushPendingAudioLocked(bool force) {
+    if (pending_audio_pcm_.empty()) {
+        return true;
+    }
+    const size_t pending_frames = pending_audio_pcm_.size() / kPcmSamplesPerFrame;
+    const size_t frames_to_send =
+        std::min(pending_frames, static_cast<size_t>(kMaxFramesPerPacket));
+    if (frames_to_send == 0 ||
+        (!force && frames_to_send < static_cast<size_t>(kMaxFramesPerPacket))) {
+        return true;
+    }
+    if (audio_websocket_ == nullptr || !audio_websocket_->IsConnected()) {
+        audio_connected_.store(false);
+        return false;
+    }
+
+    const size_t samples_to_send = frames_to_send * kPcmSamplesPerFrame;
+    std::vector<int16_t> batch(pending_audio_pcm_.begin(),
+                               pending_audio_pcm_.begin() + samples_to_send);
+    auto packet = BuildPcmPacket(batch, audio_sequence_, sample_start_);
     if (audio_frames_sent_ == 0) {
-        ESP_LOGI(TAG, "Voice Lab PCM first frame ready: samples=%u packet_bytes=%u",
-                 static_cast<unsigned>(pcm.size()),
+        ESP_LOGI(TAG, "Voice Lab PCM first batch ready: frames=%u packet_bytes=%u",
+                 static_cast<unsigned>(frames_to_send),
                  static_cast<unsigned>(packet.size()));
     }
     bool sent = audio_websocket_->Send(packet.data(), packet.size(), true);
-    if (sent) {
-        audio_frames_sent_ += pcm.size() / kPcmSamplesPerFrame;
-        audio_bytes_sent_ += pcm.size() * sizeof(int16_t);
-        auto now = static_cast<uint64_t>(esp_timer_get_time());
-        if (now - last_audio_stats_us_ >= 1000000) {
-            ESP_LOGI(TAG, "Voice Lab PCM sent: frames=%llu bytes=%llu sample_start=%llu",
-                     static_cast<unsigned long long>(audio_frames_sent_),
-                     static_cast<unsigned long long>(audio_bytes_sent_),
-                     static_cast<unsigned long long>(sample_start_));
-            last_audio_stats_us_ = now;
-        }
-    } else {
-        ESP_LOGW(TAG, "Failed to send Voice Lab PCM frame: samples=%u",
-                 static_cast<unsigned>(pcm.size()));
+    if (!sent) {
+        ESP_LOGW(TAG, "Failed to send Voice Lab PCM batch: frames=%u samples=%u",
+                 static_cast<unsigned>(frames_to_send),
+                 static_cast<unsigned>(samples_to_send));
+        return false;
     }
-    return sent;
+
+    pending_audio_pcm_.erase(pending_audio_pcm_.begin(),
+                             pending_audio_pcm_.begin() + samples_to_send);
+    audio_sequence_ += frames_to_send;
+    sample_start_ += samples_to_send;
+    audio_frames_sent_ += frames_to_send;
+    audio_bytes_sent_ += samples_to_send * sizeof(int16_t);
+    auto now = static_cast<uint64_t>(esp_timer_get_time());
+    if (now - last_audio_stats_us_ >= 1000000) {
+        ESP_LOGI(TAG, "Voice Lab PCM sent: frames=%llu bytes=%llu sample_start=%llu pending_frames=%u",
+                 static_cast<unsigned long long>(audio_frames_sent_),
+                 static_cast<unsigned long long>(audio_bytes_sent_),
+                 static_cast<unsigned long long>(sample_start_),
+                 static_cast<unsigned>(pending_audio_pcm_.size() / kPcmSamplesPerFrame));
+        last_audio_stats_us_ = now;
+    }
+    return true;
 }
 
-std::string VoiceLabClient::BuildPcmPacket(const std::vector<int16_t>& pcm) {
+std::string VoiceLabClient::BuildPcmPacket(const std::vector<int16_t>& pcm,
+                                           uint64_t first_sequence,
+                                           uint64_t first_sample_start) const {
     const uint32_t samples_per_channel = static_cast<uint32_t>(pcm.size());
     const uint8_t frame_count = static_cast<uint8_t>(samples_per_channel / kPcmSamplesPerFrame);
 
@@ -935,8 +1022,8 @@ std::string VoiceLabClient::BuildPcmPacket(const std::vector<int16_t>& pcm) {
     packet.push_back(static_cast<char>(kAudioChannels));
     packet.push_back(static_cast<char>(frame_count));
     AppendLe64(packet, boot_id_);
-    AppendLe64(packet, audio_sequence_++);
-    AppendLe64(packet, sample_start_);
+    AppendLe64(packet, first_sequence);
+    AppendLe64(packet, first_sample_start);
     AppendLe32(packet, static_cast<uint32_t>(esp_timer_get_time() / 1000));
     AppendLe32(packet, samples_per_channel);
 
@@ -946,7 +1033,6 @@ std::string VoiceLabClient::BuildPcmPacket(const std::vector<int16_t>& pcm) {
         packet.push_back(static_cast<char>((value >> 8) & 0xff));
     }
 
-    sample_start_ += samples_per_channel;
     return packet;
 }
 
@@ -1063,6 +1149,7 @@ std::string VoiceLabClient::GetStatusJson() const {
 
 void VoiceLabClient::RegisterMcpTools() {
     EnsureUsbProvisioningTask();
+    SetRecordingIndicator(false);
 
     auto& mcp_server = McpServer::GetInstance();
 

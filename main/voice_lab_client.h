@@ -43,6 +43,7 @@ private:
     static constexpr int kAudioChannels = 1;
     static constexpr int kAudioFrameDurationMs = 20;
     static constexpr int kPcmSamplesPerFrame = kAudioSampleRate * kAudioFrameDurationMs / 1000;
+    static constexpr int kMaxFramesPerPacket = 25;
 
     VoiceLabClient() = default;
     ~VoiceLabClient();
@@ -65,6 +66,7 @@ private:
     uint64_t audio_frames_sent_ = 0;
     uint64_t audio_bytes_sent_ = 0;
     uint64_t last_audio_stats_us_ = 0;
+    std::vector<int16_t> pending_audio_pcm_;
 
     bool IsAutoConnectEnabled() const;
     std::string GetConfiguredHost() const;
@@ -91,7 +93,12 @@ private:
     static std::string PrintJson(cJSON* root);
     bool SendJson(const std::string& json);
     bool SendAudioJson(const std::string& json);
-    std::string BuildPcmPacket(const std::vector<int16_t>& pcm);
+    void SetRecordingIndicator(bool recording);
+    void NotifyRecordingStarted();
+    bool FlushPendingAudioLocked(bool force);
+    std::string BuildPcmPacket(const std::vector<int16_t>& pcm,
+                               uint64_t first_sequence,
+                               uint64_t first_sample_start) const;
     void HandleJson(const cJSON* root);
     void HandleAudioJson(const cJSON* root);
 };
