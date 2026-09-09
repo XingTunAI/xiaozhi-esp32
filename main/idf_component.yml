@@ -20,7 +20,9 @@ dependencies:
   waveshare/custom_io_expander_ch32v003: ^2.0.0
   espressif/esp_lcd_panel_io_additions: ^1.0.1
   78/esp_lcd_nv3023: ==1.0.1
-  78/esp-wifi-connect: ~3.2.2
+  78/esp-wifi-connect:
+    version: ~3.2.2
+    override_path: ../local_components/esp-wifi-connect
   espressif/esp_audio_effects: ~1.3.0
   espressif/esp_audio_codec: ~2.5.0
   78/esp-ml307: ~3.6.6

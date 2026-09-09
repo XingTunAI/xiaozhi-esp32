@@ -36,6 +36,7 @@ set(SOURCES "audio/audio_codec.cc"
             "mcp_server.cc"
             "system_info.cc"
             "voice_lab_client.cc"
+            "voice_lab_prompts.cc"
             "application.cc"
             "ota.cc"
             "settings.cc"
@@ -1125,6 +1126,8 @@ add_custom_command(
     DEPENDS
         ${LANG_JSON}
         ${PROJECT_DIR}/scripts/gen_lang.py
+        ${LANG_SOUNDS}
+        ${COMMON_SOUNDS}
     COMMENT "Generating ${LANG_DIR} language config"
 )
 

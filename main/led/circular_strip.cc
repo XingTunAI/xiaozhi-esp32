@@ -7,7 +7,9 @@
 
 #define BLINK_INFINITE -1
 
-CircularStrip::CircularStrip(gpio_num_t gpio, uint16_t max_leds) : max_leds_(max_leds) {
+CircularStrip::CircularStrip(gpio_num_t gpio, uint16_t max_leds,
+                             led_color_component_format_t color_format)
+    : max_leds_(max_leds) {
     // If the gpio is not connected, you should use NoLed class
     assert(gpio != GPIO_NUM_NC);
 
@@ -16,7 +18,7 @@ CircularStrip::CircularStrip(gpio_num_t gpio, uint16_t max_leds) : max_leds_(max
     led_strip_config_t strip_config = {};
     strip_config.strip_gpio_num = gpio;
     strip_config.max_leds = max_leds_;
-    strip_config.color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB;
+    strip_config.color_component_format = color_format;
     strip_config.led_model = LED_MODEL_WS2812;
 
     led_strip_rmt_config_t rmt_config = {};

@@ -1,16 +1,21 @@
 #ifndef WIFI_BOARD_H
 #define WIFI_BOARD_H
 
-#include "board.h"
+#include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/event_groups.h>
-#include <esp_timer.h>
+#include <atomic>
+#include "board.h"
 
 class WifiBoard : public Board {
 protected:
     esp_timer_handle_t connect_timer_ = nullptr;
     bool in_config_mode_ = false;
     NetworkEventCallback network_event_callback_ = nullptr;
+#if CONFIG_VOICE_LAB_STANDALONE_MODE && CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_AUDIO_BOARD
+    std::atomic<bool> config_mode_entry_pending_{false};
+    std::atomic<bool> config_window_expired_{false};
+#endif
 
     virtual std::string GetBoardJson() override;
 

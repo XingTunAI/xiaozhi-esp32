@@ -1,10 +1,11 @@
 #include "wifi_board.h"
 
-#include "display.h"
 #include "application.h"
-#include "system_info.h"
-#include "settings.h"
 #include "assets/lang_config.h"
+#include "display.h"
+#include "settings.h"
+#include "system_info.h"
+#include "voice_lab_prompts.h"
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -54,20 +55,32 @@ void WifiBoard::StartNetwork() {
 
     // Initialize WiFi manager
     WifiManagerConfig config;
+#if CONFIG_VOICE_LAB_STANDALONE_MODE && CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_AUDIO_BOARD
+    config.ssid_prefix = "XingTun-Audio";
+    config.show_ota_config = false;
+    config.show_sleep_config = false;
+    config.customer_mode = true;
+    config.config_ap_timeout_seconds = 10 * 60;
+#else
     config.ssid_prefix = "Xiaozhi";
-    config.language = Lang::CODE;
     config.show_ota_config = true;
     config.show_sleep_config = true;
+#endif
+    config.language = Lang::CODE;
 
     // Set a DHCP hostname so the router shows a friendly name instead of "espressif".
     // Uses the same "<prefix>-<last 2 MAC bytes>" scheme as the config AP SSID.
     uint8_t mac[6];
     if (esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK) {
         char hostname[32];
-        snprintf(hostname, sizeof(hostname), "%s-%02X%02X", config.ssid_prefix.c_str(), mac[4], mac[5]);
+        snprintf(hostname, sizeof(hostname), "%s-%02X%02X", config.ssid_prefix.c_str(), mac[4],
+                 mac[5]);
         config.station_hostname = hostname;
     }
-    wifi_manager.Initialize(config);
+    if (!wifi_manager.Initialize(config)) {
+        ESP_LOGE(TAG, "WiFi initialization failed");
+        return;
+    }
 
     // Set unified event callback - forward to NetworkEvent with SSID data
     wifi_manager.SetEventCallback([this](WifiEvent event, const std::string& data) {
@@ -89,6 +102,29 @@ void WifiBoard::StartNetwork() {
                 break;
             case WifiEvent::ConfigModeExit:
                 OnNetworkEvent(NetworkEvent::WifiConfigModeExit);
+                break;
+            case WifiEvent::ConfigModeExpired:
+#if CONFIG_VOICE_LAB_STANDALONE_MODE && CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_AUDIO_BOARD
+                config_window_expired_ = true;
+                in_config_mode_ = false;
+                Application::GetInstance().Schedule([this]() {
+                    if (auto display = GetDisplay()) {
+                        display->SetStatus("配网已关闭");
+                        display->SetChatMessage("system",
+                                                "配网已超时。长按 BOOT 3 秒可重新开启配网。");
+                    }
+                    if (network_event_callback_) {
+                        network_event_callback_(NetworkEvent::WifiConfigModeExit, "");
+                    }
+                });
+                // Keep retrying saved networks, but never turn timeout into a
+                // loop of fresh AP windows. A physical long press opens a new one.
+                if (!SsidManager::GetInstance().GetSsidList().empty()) {
+                    WifiManager::GetInstance().StartStation();
+                }
+#else
+                OnNetworkEvent(NetworkEvent::WifiConfigModeExit);
+#endif
                 break;
         }
     });
@@ -117,6 +153,9 @@ void WifiBoard::TryWifiConnect() {
 void WifiBoard::OnNetworkEvent(NetworkEvent event, const std::string& data) {
     switch (event) {
         case NetworkEvent::Connected:
+#if CONFIG_VOICE_LAB_STANDALONE_MODE && CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_AUDIO_BOARD
+            config_window_expired_ = false;
+#endif
             // Stop timeout timer
             esp_timer_stop(connect_timer_);
 #ifdef CONFIG_USE_ESP_BLUFI_WIFI_PROVISIONING
@@ -134,6 +173,12 @@ void WifiBoard::OnNetworkEvent(NetworkEvent event, const std::string& data) {
             break;
         case NetworkEvent::Disconnected:
             ESP_LOGW(TAG, "WiFi disconnected");
+#if CONFIG_VOICE_LAB_STANDALONE_MODE && CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_AUDIO_BOARD
+            if (!config_window_expired_ && !config_mode_entry_pending_ && !IsInWifiConfigMode() &&
+                !esp_timer_is_active(connect_timer_)) {
+                esp_timer_start_once(connect_timer_, CONNECT_TIMEOUT_SEC * 1000000ULL);
+            }
+#endif
             break;
         case NetworkEvent::WifiConfigModeEnter:
             ESP_LOGI(TAG, "WiFi config mode entered");
@@ -163,14 +208,26 @@ void WifiBoard::OnWifiConnectTimeout(void* arg) {
     auto* board = static_cast<WifiBoard*>(arg);
     ESP_LOGW(TAG, "WiFi connection timeout, entering config mode");
 
+#if CONFIG_VOICE_LAB_STANDALONE_MODE && CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_AUDIO_BOARD
+    // Do not stop the WiFi driver or update application state on the timer task.
+    if (!WifiManager::GetInstance().IsConnected()) {
+        board->EnterWifiConfigMode();
+    }
+#else
     WifiManager::GetInstance().StopStation();
     board->StartWifiConfigMode();
+#endif
 }
 
 void WifiBoard::StartWifiConfigMode() {
     in_config_mode_ = true;
     // Transition to wifi configuring state
+#if CONFIG_VOICE_LAB_STANDALONE_MODE && CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_AUDIO_BOARD
+    Application::GetInstance().Schedule(
+        []() { Application::GetInstance().SetDeviceState(kDeviceStateWifiConfiguring); });
+#else
     Application::GetInstance().SetDeviceState(kDeviceStateWifiConfiguring);
+#endif
 #ifdef CONFIG_USE_HOTSPOT_WIFI_PROVISIONING
     auto& wifi_manager = WifiManager::GetInstance();
 
@@ -183,10 +240,17 @@ void WifiBoard::StartWifiConfigMode() {
         hint += Lang::Strings::ACCESS_VIA_BROWSER;
         hint += wifi_manager.GetApWebUrl();
 
-        Application::GetInstance().Alert(Lang::Strings::WIFI_CONFIG_MODE, hint.c_str(), "gear", Lang::Sounds::OGG_WIFICONFIG);
+#if CONFIG_VOICE_LAB_STANDALONE_MODE && CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_AUDIO_BOARD
+        // Alert logs its message, so keep the device-specific password out of it.
+        Application::GetInstance().Alert("手机配网（10 分钟）", hint.c_str(), "gear");
+        QueueVoiceLabPrompt(VoiceLabPrompt::WifiSetup);
+#else
+        Application::GetInstance().Alert(Lang::Strings::WIFI_CONFIG_MODE, hint.c_str(), "gear",
+                                         Lang::Sounds::OGG_WIFICONFIG);
+#endif
     });
 #elif CONFIG_USE_ESP_BLUFI_WIFI_PROVISIONING
-    auto &blufi = Blufi::GetInstance();
+    auto& blufi = Blufi::GetInstance();
     // initialize esp-blufi protocol
     blufi.init();
 #endif
@@ -194,6 +258,55 @@ void WifiBoard::StartWifiConfigMode() {
 
 void WifiBoard::EnterWifiConfigMode() {
     ESP_LOGI(TAG, "EnterWifiConfigMode called");
+#if CONFIG_VOICE_LAB_STANDALONE_MODE && CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_AUDIO_BOARD
+    if (IsInWifiConfigMode() || config_mode_entry_pending_.exchange(true)) {
+        return;
+    }
+    config_window_expired_ = false;
+
+    Application::GetInstance().Schedule([this]() {
+        auto& app = Application::GetInstance();
+        const auto state = app.GetDeviceState();
+        if (state == kDeviceStateUnknown || state == kDeviceStateUpgrading ||
+            state == kDeviceStateFatalError) {
+            ESP_LOGW(TAG, "Cannot enter WiFi config mode in device state %d", state);
+            config_mode_entry_pending_ = false;
+            return;
+        }
+
+        if (auto display = GetDisplay()) {
+            display->ShowNotification(Lang::Strings::ENTERING_WIFI_CONFIG_MODE);
+        }
+        app.ResetProtocol();
+        // ResetProtocol schedules its cleanup. Queue the transition after it so
+        // active audio states can return to idle before entering configuration.
+        app.Schedule([this]() {
+            auto& app = Application::GetInstance();
+            const auto state = app.GetDeviceState();
+            if (state == kDeviceStateConnecting || state == kDeviceStateListening ||
+                state == kDeviceStateSpeaking || state == kDeviceStateNotifying) {
+                app.SetDeviceState(kDeviceStateIdle);
+            }
+
+            // Reconfiguration only changes the active network. Saved device
+            // identity, credentials and service settings remain in NVS.
+            const auto created = xTaskCreate(
+                [](void* arg) {
+                    auto* board = static_cast<WifiBoard*>(arg);
+                    esp_timer_stop(board->connect_timer_);
+                    WifiManager::GetInstance().StopStation();
+                    board->StartWifiConfigMode();
+                    board->config_mode_entry_pending_ = false;
+                    vTaskDelete(nullptr);
+                },
+                "wifi_cfg_change", 4096, this, 2, nullptr);
+            if (created != pdPASS) {
+                config_mode_entry_pending_ = false;
+                ESP_LOGE(TAG, "Failed to create WiFi reconfiguration task");
+            }
+        });
+    });
+#else
     GetDisplay()->ShowNotification(Lang::Strings::ENTERING_WIFI_CONFIG_MODE);
 
     auto& app = Application::GetInstance();
@@ -204,26 +317,31 @@ void WifiBoard::EnterWifiConfigMode() {
         // Reset protocol (close audio channel, reset protocol)
         Application::GetInstance().ResetProtocol();
 
-        xTaskCreate([](void* arg) {
-            auto* board = static_cast<WifiBoard*>(arg);
+        xTaskCreate(
+            [](void* arg) {
+                auto* board = static_cast<WifiBoard*>(arg);
 
-            // Wait for 1 second to allow speaking to finish gracefully
-            vTaskDelay(pdMS_TO_TICKS(1000));
+                // Wait for 1 second to allow speaking to finish gracefully
+                vTaskDelay(pdMS_TO_TICKS(1000));
 
-            // Stop any ongoing connection attempt
-            esp_timer_stop(board->connect_timer_);
-            WifiManager::GetInstance().StopStation();
+                // Stop any ongoing connection attempt
+                esp_timer_stop(board->connect_timer_);
+                WifiManager::GetInstance().StopStation();
 
-            // Enter config mode
-            board->StartWifiConfigMode();
+                // Enter config mode
+                board->StartWifiConfigMode();
 
-            vTaskDelete(NULL);
-        }, "wifi_cfg_delay", 4096, this, 2, NULL);
+                vTaskDelete(NULL);
+            },
+            "wifi_cfg_delay", 4096, this, 2, NULL);
         return;
     }
 
     if (state != kDeviceStateStarting) {
-        ESP_LOGE(TAG, "EnterWifiConfigMode called but device state is not starting or speaking, device state: %d", state);
+        ESP_LOGE(TAG,
+                 "EnterWifiConfigMode called but device state is not starting or speaking, device "
+                 "state: %d",
+                 state);
         return;
     }
 
@@ -232,11 +350,10 @@ void WifiBoard::EnterWifiConfigMode() {
     WifiManager::GetInstance().StopStation();
 
     StartWifiConfigMode();
+#endif
 }
 
-bool WifiBoard::IsInWifiConfigMode() const {
-    return WifiManager::GetInstance().IsConfigMode();
-}
+bool WifiBoard::IsInWifiConfigMode() const { return WifiManager::GetInstance().IsConfigMode(); }
 
 NetworkInterface* WifiBoard::GetNetwork() {
     static EspNetwork network;

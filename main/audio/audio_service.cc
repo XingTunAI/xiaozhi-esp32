@@ -169,10 +169,10 @@ void AudioService::Start() {
 void AudioService::Stop() {
     esp_timer_stop(audio_power_timer_);
     service_stopped_.store(true);
-    xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING |
-        AS_EVENT_WAKE_WORD_RUNNING |
-        AS_EVENT_AUDIO_PROCESSOR_RUNNING |
-        AS_EVENT_EXTERNAL_CAPTURE_RUNNING);
+    EnableExternalCapture(false);
+    xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING | AS_EVENT_WAKE_WORD_RUNNING |
+                                         AS_EVENT_AUDIO_PROCESSOR_RUNNING |
+                                         AS_EVENT_EXTERNAL_CAPTURE_RUNNING);
 
     bool notify_drained = false;
     {
@@ -303,9 +303,21 @@ void AudioService::AudioInputTask() {
         }
 
         if (bits & AS_EVENT_EXTERNAL_CAPTURE_RUNNING) {
+            uint64_t capture_generation;
+            {
+                std::lock_guard<std::mutex> lock(external_capture_mutex_);
+                // The event bits returned by waitBits may predate a stop.
+                if (!external_capture_enabled_ || service_stopped_.load()) {
+                    continue;
+                }
+                capture_generation = external_capture_generation_;
+                external_capture_in_flight_ = true;
+            }
+
             std::vector<int16_t> data;
             int samples = EXTERNAL_CAPTURE_FRAME_DURATION_MS * 16000 / 1000;
-            if (ReadAudioData(data, 16000, samples)) {
+            bool read_ok = ReadAudioData(data, 16000, samples);
+            if (read_ok) {
                 ++external_capture_read_ok;
                 if (codec_->input_channels() > 1) {
                     auto channels = codec_->input_channels();
@@ -315,29 +327,46 @@ void AudioService::AudioInputTask() {
                     }
                     data = std::move(mono_data);
                 }
-                if (callbacks_.on_external_capture_audio) {
+                bool deliver_frame;
+                {
+                    std::lock_guard<std::mutex> lock(external_capture_mutex_);
+                    // Disabling capture retains this already-started frame.
+                    // A new epoch must never receive an earlier epoch's PCM.
+                    deliver_frame = capture_generation == external_capture_generation_;
+                }
+                if (deliver_frame && callbacks_.on_external_capture_audio) {
                     callbacks_.on_external_capture_audio(std::move(data));
-                } else {
+                } else if (deliver_frame) {
                     ++external_capture_callback_missing;
                 }
                 auto now_us = esp_timer_get_time();
                 if (now_us - last_external_capture_stats_us >= 1000000) {
-                    ESP_LOGI(TAG, "External capture stats: read_ok=%u read_fail=%u callback_missing=%u",
+                    ESP_LOGI(TAG,
+                             "External capture stats: read_ok=%u read_fail=%u callback_missing=%u",
                              external_capture_read_ok, external_capture_read_fail,
                              external_capture_callback_missing);
                     last_external_capture_stats_us = now_us;
                 }
-                continue;
             } else {
                 ++external_capture_read_fail;
                 auto now_us = esp_timer_get_time();
                 if (now_us - last_external_capture_stats_us >= 1000000) {
-                    ESP_LOGW(TAG, "External capture stats: read_ok=%u read_fail=%u callback_missing=%u",
+                    ESP_LOGW(TAG,
+                             "External capture stats: read_ok=%u read_fail=%u callback_missing=%u",
                              external_capture_read_ok, external_capture_read_fail,
                              external_capture_callback_missing);
                     last_external_capture_stats_us = now_us;
                 }
             }
+            {
+                std::lock_guard<std::mutex> lock(external_capture_mutex_);
+                external_capture_in_flight_ = false;
+            }
+            external_capture_cv_.notify_all();
+            if (!read_ok) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+            continue;
         }
 
         /* Feed the selected audio engine */
@@ -773,13 +802,45 @@ void AudioService::EnableAudioTesting(bool enable) {
 
 void AudioService::EnableExternalCapture(bool enable) {
     ESP_LOGI(TAG, "%s external audio capture", enable ? "Enabling" : "Disabling");
+    std::lock_guard<std::mutex> lock(external_capture_mutex_);
     if (enable) {
+        if (!external_capture_enabled_) {
+            // A caller must complete the stop barrier before starting another
+            // recording. Never route the old callback into a new capture epoch.
+            if (external_capture_in_flight_) {
+                ESP_LOGW(TAG, "External capture start rejected while previous frame is draining");
+                return;
+            }
+            ++external_capture_generation_;
+            external_capture_enabled_ = true;
+        }
         xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING |
-            AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING);
+                                               AS_EVENT_WAKE_WORD_RUNNING |
+                                               AS_EVENT_AUDIO_PROCESSOR_RUNNING);
         xEventGroupSetBits(event_group_, AS_EVENT_EXTERNAL_CAPTURE_RUNNING);
     } else {
+        external_capture_enabled_ = false;
         xEventGroupClearBits(event_group_, AS_EVENT_EXTERNAL_CAPTURE_RUNNING);
     }
+}
+
+bool AudioService::StopExternalCaptureAndWait(uint32_t timeout_ms) {
+    std::unique_lock<std::mutex> lock(external_capture_mutex_);
+    external_capture_enabled_ = false;
+    xEventGroupClearBits(event_group_, AS_EVENT_EXTERNAL_CAPTURE_RUNNING);
+    const uint64_t generation = external_capture_generation_;
+
+    if (xTaskGetCurrentTaskHandle() == audio_input_task_handle_) {
+        // In particular, an external PCM callback cannot wait for itself.
+        return !external_capture_in_flight_;
+    }
+
+    bool drained = external_capture_cv_.wait_for(
+        lock, std::chrono::milliseconds(timeout_ms), [this, generation]() {
+            return !external_capture_in_flight_ || external_capture_generation_ != generation;
+        });
+    return drained && !external_capture_in_flight_ && !external_capture_enabled_ &&
+           external_capture_generation_ == generation;
 }
 
 void AudioService::EnableDeviceAec(bool enable) {

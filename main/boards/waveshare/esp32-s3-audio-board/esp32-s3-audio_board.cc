@@ -19,6 +19,13 @@
 #include "led/circular_strip.h"
 #include "esp_lcd_jd9853.h"
 
+#if CONFIG_VOICE_LAB_STANDALONE_MODE
+#include <algorithm>
+
+#include "expander_buttons.h"
+#include "voice_lab_board_ui.h"
+#endif
+
 #define TAG "waveshare_s3_audio_board"
 
 #define LCD_OPCODE_WRITE_CMD        (0x02ULL)
@@ -30,8 +37,15 @@ private:
     Button boot_button_;
     i2c_master_bus_handle_t i2c_bus_;
     esp_io_expander_handle_t io_expander = NULL;
-    LcdDisplay* display_;
-    EspVideo* camera_;
+    Display* display_ = nullptr;
+    EspVideo* camera_ = nullptr;
+#if CONFIG_VOICE_LAB_STANDALONE_MODE
+    WaveshareVoiceLabButtons voice_lab_buttons_;
+    WaveshareExpanderButtons expander_buttons_;
+    static constexpr uint16_t kBootLongPressMs = 3000;
+#else
+    static constexpr uint16_t kBootLongPressMs = 0;
+#endif
 
     void InitializeI2c() {
         // Initialize I2C peripheral
@@ -145,6 +159,34 @@ private:
     }
 
     void InitializeButtons() {
+#if CONFIG_VOICE_LAB_STANDALONE_MODE
+        voice_lab_buttons_.Bind(boot_button_, [this]() { EnterWifiConfigMode(); });
+        if (!expander_buttons_.Initialize(
+                io_expander,
+                [this](WaveshareExpanderButtons::Key key) {
+                    if (key == WaveshareExpanderButtons::Key::K2) {
+                        voice_lab_buttons_.OnPrimaryClick();
+                        return;
+                    }
+                    auto* codec = GetAudioCodec();
+                    if (codec == nullptr) {
+                        return;
+                    }
+                    const int delta = key == WaveshareExpanderButtons::Key::K1 ? 10 : -10;
+                    const int volume = std::clamp(codec->output_volume() + delta, 0, 100);
+                    codec->SetOutputVolume(volume);
+                    if (auto* display = GetDisplay()) {
+                        display->ShowNotification("音量 " + std::to_string(volume) + "%");
+                    }
+                },
+                [this](WaveshareExpanderButtons::Key key) {
+                    if (key == WaveshareExpanderButtons::Key::K2) {
+                        voice_lab_buttons_.OnPrimaryLongPress();
+                    }
+                })) {
+            ESP_LOGE(TAG, "K1/K2/K3 initialization failed; BOOT recovery remains available");
+        }
+#else
         boot_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
             if (app.GetDeviceState() == kDeviceStateStarting) {
@@ -153,6 +195,7 @@ private:
             }
             app.ToggleChatState();
         });
+#endif
     }
 
     void InitializeCamera() {
@@ -193,33 +236,58 @@ private:
         };
 
         camera_ = new EspVideo(video_config);
-
     }
+
 public:
-    CustomBoard() :
-        boot_button_(BOOT_BUTTON_GPIO) {
+    CustomBoard() : boot_button_(BOOT_BUTTON_GPIO, false, kBootLongPressMs) {
         InitializeI2c();
         InitializeTca9555();
+#if CONFIG_VOICE_LAB_AUDIO_ONLY
+        static NoDisplay no_display;
+        display_ = &no_display;
+        InitializeButtons();
+#else
         InitializeSpi();
         InitializeButtons();
-        #ifdef LCD_TYPE_JD9853_SERIAL
-        InitializeJd9853Display(); 
-        #else
-        InitializeSt7789Display(); 
-        #endif
+#ifdef LCD_TYPE_JD9853_SERIAL
+        InitializeJd9853Display();
+#else
+        InitializeSt7789Display();
+#endif
         InitializeCamera();
         GetBacklight()->RestoreBrightness();
+#endif
     }
 
     virtual Led* GetLed() override {
+#if CONFIG_VOICE_LAB_STANDALONE_MODE
+        // Waveshare schematic v1.1: U9..U14 and U19 form a seven-pixel ring.
+        static WaveshareVoiceLabStrip led(BUILTIN_LED_GPIO, 7);
+#else
         static CircularStrip led(BUILTIN_LED_GPIO, 6);
+#endif
         return &led;
     }
 
+#if CONFIG_VOICE_LAB_STANDALONE_MODE
+    void SetNetworkEventCallback(NetworkEventCallback callback) override {
+        WifiBoard::SetNetworkEventCallback(
+            [this, callback = std::move(callback)](NetworkEvent event, const std::string& data) {
+                static_cast<WaveshareVoiceLabStrip*>(GetLed())->OnNetworkEvent(event);
+                if (callback) {
+                    callback(event, data);
+                }
+            });
+    }
+#endif
+
     virtual AudioCodec* GetAudioCodec() override {
-        static BoxAudioCodec audio_codec(i2c_bus_, AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
-            AUDIO_I2S_GPIO_MCLK, AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS, AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN, AUDIO_CODEC_PA_PIN, AUDIO_CODEC_ES8311_ADDR, AUDIO_CODEC_ES7210_ADDR, AUDIO_INPUT_REFERENCE);
-            return &audio_codec;
+        static BoxAudioCodec audio_codec(
+            i2c_bus_, AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE, AUDIO_I2S_GPIO_MCLK,
+            AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS, AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN,
+            AUDIO_CODEC_PA_PIN, AUDIO_CODEC_ES8311_ADDR, AUDIO_CODEC_ES7210_ADDR,
+            AUDIO_INPUT_REFERENCE);
+        return &audio_codec;
     }
 
     virtual Display* GetDisplay() override {
@@ -227,8 +295,12 @@ public:
     }
     
     virtual Backlight* GetBacklight() override {
+#if CONFIG_VOICE_LAB_AUDIO_ONLY
+        return nullptr;
+#else
         static PwmBacklight backlight(DISPLAY_BACKLIGHT_PIN, BACKLIGHT_INVERT);
         return &backlight;
+#endif
     }
 
     virtual Camera* GetCamera() override {

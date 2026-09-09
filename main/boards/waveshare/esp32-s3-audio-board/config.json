@@ -16,6 +16,22 @@
                 "CONFIG_CAMERA_OV5640_DVP_YUV422_800X600_10FPS=y",
                 "CONFIG_CAMERA_OV5640_DVP_IF_FORMAT_INDEX_DEFAULT=0"
             ]
+        },
+        {
+            "name": "esp32-s3-audio-board-voice-lab-audio-only",
+            "sdkconfig_append": [
+                "CONFIG_VOICE_LAB_STANDALONE_MODE=y",
+                "CONFIG_VOICE_LAB_AUDIO_ONLY=y",
+                "CONFIG_VOICE_LAB_SUPPRESS_XIAOZHI_ACTIVATION=y",
+                "CONFIG_VOICE_LAB_SERVER_HOST=\"voice-lab.cloud\"",
+                "CONFIG_VOICE_LAB_SERVER_PORT=443",
+                "CONFIG_VOICE_LAB_SERVER_TLS=y",
+                "CONFIG_VOICE_LAB_DEVICE_KEY=\"\"",
+                "CONFIG_VOICE_LAB_DEVICE_TOKEN=\"\"",
+                "CONFIG_VOICE_LAB_HARDWARE_PROFILE=\"esp32-s3-audio-board\"",
+                "CONFIG_VOICE_LAB_AUDIO_FRONTEND=\"waveshare-esp32-s3-audio-board-es7210\"",
+                "CONFIG_USE_WECHAT_MESSAGE_STYLE=y"
+            ]
         }
     ]
 }

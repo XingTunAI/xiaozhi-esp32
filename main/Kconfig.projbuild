@@ -91,6 +91,15 @@ config VOICE_LAB_STANDALONE_MODE
         activation/protocol startup and does not play the activation-complete
         sound after networking is ready.
 
+config VOICE_LAB_AUDIO_ONLY
+    bool "Waveshare Voice Lab without display or camera"
+    depends on BOARD_TYPE_WAVESHARE_ESP32_S3_AUDIO_BOARD && VOICE_LAB_STANDALONE_MODE
+    default n
+    help
+        Use the microphone, speaker, RGB ring and physical buttons only.
+        Do not initialize the SPI display, backlight or camera. Provisioning
+        instructions and the device-specific hotspot password are spoken.
+
 endmenu
 
 choice

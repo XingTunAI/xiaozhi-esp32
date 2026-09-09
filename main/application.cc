@@ -10,12 +10,14 @@
 #include "system_info.h"
 #include "text_glyph_payload.h"
 #include "voice_lab_client.h"
+#include "voice_lab_prompts.h"
 #include "websocket_protocol.h"
 
 #include <driver/gpio.h>
 #include <esp_log.h>
 #include <arpa/inet.h>
 #include <cJSON.h>
+#include <atomic>
 #include <cstring>
 #include <limits>
 
@@ -28,6 +30,16 @@
 #ifndef CONFIG_VOICE_LAB_STANDALONE_MODE
 #define CONFIG_VOICE_LAB_STANDALONE_MODE 1
 #endif
+
+namespace {
+bool IsVoiceLabCaptureBusy() {
+    auto& client = VoiceLabClient::GetInstance();
+    const auto state = client.GetUserState();
+    return client.IsRecording() || state == VoiceLabClient::UserState::Starting ||
+           state == VoiceLabClient::UserState::Recording ||
+           state == VoiceLabClient::UserState::Stopping;
+}
+}  // namespace
 
 Application::Application() : notify_player_(audio_service_) {
     event_group_ = xEventGroupCreate();
@@ -123,6 +135,14 @@ void Application::Initialize() {
         switch (event) {
             case NetworkEvent::Scanning:
                 display->ShowNotification(Lang::Strings::SCANNING_WIFI, 30000);
+#if CONFIG_VOICE_LAB_STANDALONE_MODE
+                // The first scan is expected startup progress. Treating it as
+                // an outage would leave a false red alarm until cloud connect.
+                if (GetDeviceState() == kDeviceStateStarting &&
+                    !VoiceLabClient::GetInstance().IsConnected() &&
+                    !VoiceLabClient::GetInstance().IsRecording())
+                    break;
+#endif
                 xEventGroupSetBits(event_group_, MAIN_EVENT_NETWORK_DISCONNECTED);
                 break;
             case NetworkEvent::Connecting: {
@@ -299,6 +319,9 @@ void Application::Run() {
 void Application::HandleNetworkConnectedEvent() {
     ESP_LOGI(TAG, "Network connected");
     VoiceLabClient::GetInstance().ConnectAsync();
+#if CONFIG_VOICE_LAB_STANDALONE_MODE
+    QueueVoiceLabPrompt(VoiceLabPrompt::Connected);
+#endif
     auto state = GetDeviceState();
 
     if (state == kDeviceStateStarting || state == kDeviceStateWifiConfiguring) {
@@ -325,7 +348,7 @@ void Application::HandleNetworkConnectedEvent() {
 }
 
 void Application::HandleNetworkDisconnectedEvent() {
-    VoiceLabClient::GetInstance().Disconnect();
+    VoiceLabClient::GetInstance().NotifyNetworkDisconnected();
 
     // Close current conversation when network disconnected
     auto state = GetDeviceState();
@@ -1028,7 +1051,11 @@ void Application::HandleStateChangedEvent() {
             display->ClearChatMessages();    // Clear messages first
             display->SetEmotion("neutral");  // Then set emotion (wechat mode checks child count)
             audio_service_.EnableVoiceProcessing(false);
+#if CONFIG_VOICE_LAB_STANDALONE_MODE
+            audio_service_.EnableWakeWordDetection(false);
+#else
             audio_service_.EnableWakeWordDetection(true);
+#endif
             break;
         case kDeviceStateConnecting:
             display->SetStatus(Lang::Strings::CONNECTING);
@@ -1110,6 +1137,12 @@ void Application::ConfigureWakeWordForListening() {
 }
 
 void Application::StartNotification(std::string audio_url, std::vector<NotifySubtitle> subtitles) {
+#if CONFIG_VOICE_LAB_STANDALONE_MODE
+    if (IsVoiceLabCaptureBusy()) {
+        ESP_LOGW(TAG, "Ignoring notify message while Voice Lab capture is busy");
+        return;
+    }
+#endif
     if (GetDeviceState() != kDeviceStateIdle || notify_player_.IsBusy()) {
         ESP_LOGW(TAG, "Ignoring notify message while device is busy");
         return;
@@ -1118,7 +1151,11 @@ void Application::StartNotification(std::string audio_url, std::vector<NotifySub
     auto& board = Board::GetInstance();
     board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
     audio_service_.EnableVoiceProcessing(false);
+#if CONFIG_VOICE_LAB_STANDALONE_MODE
+    audio_service_.EnableWakeWordDetection(false);
+#else
     audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
+#endif
     audio_service_.ReleaseWakeWordResources();
     while (audio_service_.PopPacketFromSendQueue()) {
         // Discard microphone audio left over from a previous conversation.
@@ -1371,10 +1408,15 @@ void Application::SetAecMode(AecMode mode) {
 void Application::PlaySound(const std::string_view& sound) { audio_service_.PlaySound(sound); }
 
 bool Application::StartVoiceLabPlayback(const std::string& audio_url) {
-    if (audio_url.empty()) {
+    if (audio_url.empty() || IsVoiceLabCaptureBusy()) {
         return false;
     }
     Schedule([this, audio_url]() {
+        // Capture may have started after the URL was accepted on another task.
+        if (IsVoiceLabCaptureBusy()) {
+            ESP_LOGW(TAG, "Ignoring deferred Voice Lab playback while capture is busy");
+            return;
+        }
         StartNotification(audio_url, {});
     });
     return true;
@@ -1388,6 +1430,48 @@ void Application::StopVoiceLabPlayback() {
             audio_service_.ResetDecoder();
         }
     });
+}
+
+bool Application::PrepareVoiceLabCapture(uint32_t timeout_ms) {
+    constexpr uint32_t kMaxTimeoutMs = 6000;
+    if (timeout_ms == 0) {
+        return false;
+    }
+    if (timeout_ms > kMaxTimeoutMs) {
+        timeout_ms = kMaxTimeoutMs;
+    }
+    const int64_t deadline_us = esp_timer_get_time() + static_cast<int64_t>(timeout_ms) * 1000;
+    auto stop_completed = std::make_shared<std::atomic<bool>>(false);
+    Schedule([this, stop_completed, deadline_us]() {
+        // The caller may already have timed out. Do not stop a later session.
+        if (esp_timer_get_time() >= deadline_us) {
+            return;
+        }
+        if (GetDeviceState() == kDeviceStateNotifying) {
+            StopNotification();
+        } else {
+            notify_player_.Stop();
+        }
+        stop_completed->store(true, std::memory_order_release);
+    });
+
+    bool decoder_reset = false;
+    while (esp_timer_get_time() < deadline_us) {
+        if (stop_completed->load(std::memory_order_acquire) && !notify_player_.IsBusy()) {
+            if (!decoder_reset) {
+                // Stop() only cancels the HTTP worker. Wait for its final possible enqueue
+                // before clearing audio, then let any output already in flight finish.
+                audio_service_.ResetDecoder();
+                decoder_reset = true;
+            }
+            if (audio_service_.IsPlaybackIdle()) {
+                return esp_timer_get_time() < deadline_us;
+            }
+        }
+        vTaskDelay(1);
+    }
+    ESP_LOGW(TAG, "Timed out waiting for notification playback to stop before capture");
+    return false;
 }
 
 void Application::ResetProtocol() {

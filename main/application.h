@@ -119,6 +119,9 @@ public:
     void PlaySound(const std::string_view& sound);
     bool StartVoiceLabPlayback(const std::string& audio_url);
     void StopVoiceLabPlayback();
+    // Worker only: keep Voice Lab in Starting while stopping notification download/playback.
+    // Returns false unless the worker and queued audio are drained within at most 6000 ms.
+    bool PrepareVoiceLabCapture(uint32_t timeout_ms);
     AudioService& GetAudioService() { return audio_service_; }
     
     /**

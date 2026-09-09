@@ -134,7 +134,13 @@ public:
     void ReleaseWakeWordResources();
     void EnableVoiceProcessing(bool enable);
     void EnableAudioTesting(bool enable);
+    // Nonblocking. A new enable is rejected until the previous frame/callback
+    // has drained; use the stop barrier before starting a new recording.
     void EnableExternalCapture(bool enable);
+    // Worker-only barrier: disable new reads and wait for the current PCM
+    // callback to return. Do not hold a lock needed by that callback. A false
+    // result means the old capture epoch must not be reused for a new recording.
+    bool StopExternalCaptureAndWait(uint32_t timeout_ms);
     void EnableDeviceAec(bool enable);
 
     void SetCallbacks(AudioServiceCallbacks& callbacks);
@@ -155,6 +161,11 @@ private:
     void* opus_decoder_ = nullptr;
     std::mutex decoder_mutex_;
     std::mutex input_resampler_mutex_;
+    std::mutex external_capture_mutex_;
+    std::condition_variable external_capture_cv_;
+    bool external_capture_enabled_ = false;
+    bool external_capture_in_flight_ = false;
+    uint64_t external_capture_generation_ = 0;
     esp_ae_rate_cvt_handle_t input_resampler_ = nullptr;
     esp_ae_rate_cvt_handle_t output_resampler_ = nullptr;
     
