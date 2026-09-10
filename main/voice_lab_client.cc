@@ -1212,7 +1212,7 @@ bool VoiceLabClient::ToggleRecordingPause(uint32_t authorized_epoch, uint32_t ca
         const auto cutoff = CaptureSampleEnd();
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            for (int i = 0; i < kMaxPendingPcmPackets; ++i) {
+            for (int i = 0; i < kMaxPendingPcmFrames; ++i) {
                 if (!FlushPendingAudioLocked()) {
                     AbortRecording();
                     return false;
@@ -1512,8 +1512,7 @@ bool VoiceLabClient::StartAuthorizedRecording(const std::string& recording_id,
             pending_audio_pcm_.clear();
             // Allocate before microphone capture, avoiding reallocations in
             // the producer when a socket write briefly falls behind.
-            pending_audio_pcm_.reserve(kMaxPendingPcmPackets * kMaxFramesPerPacket *
-                                       kPcmSamplesPerFrame);
+            pending_audio_pcm_.reserve(kMaxPendingPcmFrames * kPcmSamplesPerFrame);
         }
         unacknowledged_audio_.clear();
         acknowledged_sample_end_.store(sample_start_);
@@ -1638,7 +1637,7 @@ bool VoiceLabClient::StopRecording() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (audio_websocket_ != nullptr && audio_websocket_->IsConnected()) {
-            for (int i = 0; i < kMaxPendingPcmPackets; ++i) {
+            for (int i = 0; i < kMaxPendingPcmFrames; ++i) {
                 if (!FlushPendingAudioLocked()) {
                     interrupted_.store(true);
                     break;
@@ -1767,7 +1766,7 @@ bool VoiceLabClient::SendPcmAudio(std::vector<int16_t>&& pcm) {
         return false;
     }
     if (pending_audio_pcm_.size() + pcm.size() >
-        static_cast<size_t>(kMaxPendingPcmPackets * kMaxFramesPerPacket * kPcmSamplesPerFrame)) {
+        static_cast<size_t>(kMaxPendingPcmFrames * kPcmSamplesPerFrame)) {
         ESP_LOGW(TAG, "Voice Lab PCM buffer full; rejecting capture chunk");
         AbortRecording();
         return false;

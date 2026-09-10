@@ -69,14 +69,14 @@ private:
     static constexpr int kAudioChannels = 1;
     static constexpr int kAudioFrameDurationMs = 20;
     static constexpr int kPcmSamplesPerFrame = kAudioSampleRate * kAudioFrameDurationMs / 1000;
-    static constexpr int kMaxFramesPerPacket = 25;
+    static constexpr int kMaxFramesPerPacket = 1;
     // Bound retained audio by duration, independent of variable packet sizes.
     static constexpr uint64_t kMaxUnacknowledgedSamples = kAudioSampleRate * 4;
 #if CONFIG_SPIRAM
     // Four seconds of capture absorbs short Wi-Fi/TLS stalls on PSRAM boards.
-    static constexpr int kMaxPendingPcmPackets = 8;
+    static constexpr int kMaxPendingPcmFrames = 4000 / kAudioFrameDurationMs;
 #else
-    static constexpr int kMaxPendingPcmPackets = 2;
+    static constexpr int kMaxPendingPcmFrames = 1000 / kAudioFrameDurationMs;
 #endif
 
     VoiceLabClient() = default;
