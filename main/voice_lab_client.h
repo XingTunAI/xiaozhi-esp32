@@ -70,6 +70,12 @@ private:
     static constexpr int kAudioFrameDurationMs = 20;
     static constexpr int kPcmSamplesPerFrame = kAudioSampleRate * kAudioFrameDurationMs / 1000;
     static constexpr int kMaxFramesPerPacket = 25;
+#if CONFIG_SPIRAM
+    // Four seconds of capture absorbs short Wi-Fi/TLS stalls on PSRAM boards.
+    static constexpr int kMaxPendingPcmPackets = 8;
+#else
+    static constexpr int kMaxPendingPcmPackets = 2;
+#endif
 
     VoiceLabClient() = default;
     ~VoiceLabClient();

@@ -235,6 +235,18 @@ python scripts\build.py waveshare/esp32-s3-audio-board --name esp32-s3-audio-boa
 ### 同一会话暂停 / 继续与正常结束
 
 最新 K2 操作为长按约 2 秒开始 / 结束，短按暂停 / 继续；重新配网保留 BOOT 长按 3 秒。
+
+### 2026-09-10 云端构建与长录音追加修复
+
+源码 `040a8d6` 使用乐鑫官方 ESP-IDF v6.1 容器在 GitHub Actions 成功构建并烧录 COM30，应用 SHA-256
+为 `f1d4cd255de591347542faca9b531ec6fc3310bc3c80a5f77611aa881a1da1f4`。联网及新版状态协议上报正常，
+停止后未复现旧的堆损坏重启。但连续录音在 51.5 秒时遇到 PCM 生产缓存满，结果正确标为 interrupted，
+不能算长录音验收通过。串口显示发送短暂停顿时，仅一秒的生产缓存被填满。
+
+追加将启用 PSRAM 的板型生产缓存限定为四秒（128 KB），在采音前预留空间，避免采音任务动态扩容；
+无 PSRAM 板型维持原一秒上限。暂停和停止同步排空最多八包，保留末尾样本与 ACK 校验，未确认缓存
+和重传期限仍有界。开始状态显式上报 captureState=recording，避免页面沿用旧 starting 状态。
+追加修复需重新构建及实机验证；不将第一次构建成功等同于追加代码已烧录。
 暂停先停止输入线程、发送已采集前缀，并等待音频 ACK 覆盖截止点后报告 `captureState: paused, paused: true, recording: false, captureSampleEnd`；不发送 `end`，不关闭音频 WebSocket，不改变会话、起始 revision、样本或序列号。确认期间黄色流动，服务端确认后黄色常亮并播放 `vl_recording_pause.ogg`。
 继续时先在麦克风停止状态播放 `vl_recording_resume.ogg` 并留 150 ms 间隔，再报告 `captureState: recording, paused: false, recording: true` 和原开始身份，收到对应确认后才启用采集。
 
