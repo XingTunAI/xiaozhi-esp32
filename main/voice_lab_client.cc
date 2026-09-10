@@ -1668,19 +1668,29 @@ bool VoiceLabClient::RetransmitAudioLocked() {
         return true;
     if (!audio_websocket_ || !audio_websocket_->IsConnected())
         return false;
-    const auto now = esp_timer_get_time();
-    // Retain original packet IDs so a retry cannot duplicate captured speech.
-    // Retry in sequence order, at most twice; never grow the buffer indefinitely.
-    for (auto& packet : unacknowledged_audio_) {
-        if (now - packet.last_sent_us < 1500000)
-            break;
-        if (packet.retries >= 2)
-            return false;
-        if (!audio_websocket_->Send(packet.bytes.data(), packet.bytes.size(), true))
-            return false;
-        packet.last_sent_us = now;
-        ++packet.retries;
+    {
+        std::lock_guard<std::mutex> pcm_lock(pcm_mutex_);
+        // A blocked TCP write can accumulate fresh microphone frames. Drain
+        // those first: replaying an entire old window amplifies the same stall.
+        if (!pending_audio_pcm_.empty())
+            return true;
     }
+    const auto now = esp_timer_get_time();
+    // One oldest packet per worker pass is sufficient to solicit a cumulative
+    // ACK. TCP already preserves ordering/retransmits transport loss. Never
+    // synchronously replay the whole window while fresh capture continues.
+    auto& packet = unacknowledged_audio_.front();
+    if (now - packet.last_sent_us < 1500000 || packet.sample_end <= acknowledged_sample_end_.load())
+        return true;
+    if (packet.retries >= 2)
+        return false;
+    if (!audio_websocket_->Send(packet.bytes.data(), packet.bytes.size(), true))
+        return false;
+    packet.last_sent_us = esp_timer_get_time();
+    ++packet.retries;
+    ESP_LOGI(TAG, "Voice Lab bounded audio retry: sample_end=%llu elapsed_ms=%lld",
+             static_cast<unsigned long long>(packet.sample_end),
+             static_cast<long long>((packet.last_sent_us - now) / 1000));
     return true;
 }
 
