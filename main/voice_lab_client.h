@@ -57,9 +57,7 @@ private:
     static constexpr int kAudioChannels = 1;
     static constexpr int kAudioFrameDurationMs = 20;
     static constexpr int kPcmSamplesPerFrame = kAudioSampleRate * kAudioFrameDurationMs / 1000;
-    // Send immediately; combine at most two frames already waiting after a
-    // stall. 1320 bytes of VLA2 PCM stays small without waiting to form a batch.
-    static constexpr int kMaxFramesPerPacket = 2;
+    static constexpr int kMaxFramesPerPacket = 1;
     // Bound retained audio by duration, independent of variable packet sizes.
     static constexpr uint64_t kMaxUnacknowledgedSamples = kAudioSampleRate * 4;
 #if CONFIG_SPIRAM

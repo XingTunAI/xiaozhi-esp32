@@ -136,12 +136,6 @@ void WifiStation::Start() {
         IP_EVENT, IP_EVENT_STA_GOT_IP, &WifiStation::IpEventHandler, this, &instance_got_ip_));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
-#if CONFIG_VOICE_LAB_STANDALONE_MODE
-    // The audio-only station needs 32 KB/s. Keep its 2.4 GHz link at 20 MHz
-    // instead of negotiating a secondary channel for unused peak bandwidth.
-    const auto bandwidth_result = esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW20);
-    ESP_LOGI(TAG, "Voice Lab station bandwidth 20 MHz: %s", esp_err_to_name(bandwidth_result));
-#endif
 
     if (max_tx_power_ != 0) {
         ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(max_tx_power_));
