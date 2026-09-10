@@ -20,17 +20,7 @@
 
 class VoiceLabClient {
 public:
-    enum class UserState {
-        Connecting,
-        Ready,
-        Requesting,
-        Starting,
-        Recording,
-        Pausing,
-        Paused,
-        Stopping,
-        Error
-    };
+    enum class UserState { Connecting, Ready, Requesting, Starting, Recording, Stopping, Error };
     UserState GetUserState() const { return user_state_.load(); }
     static VoiceLabClient& GetInstance() {
         static VoiceLabClient instance;
@@ -49,7 +39,6 @@ public:
     void NotifyNetworkDisconnected();
     bool IsConnected() const;
     bool IsRecording() const { return recording_.load(); }
-    bool IsCapturePaused() const { return capture_paused_.load(); }
 
     bool PairWithEnrollmentCode(const std::string& enrollment_code);
     void ClearPairing();
@@ -57,7 +46,6 @@ public:
     bool StartRecording(const std::string& recording_id = "",
                         const std::string& mode = "meeting_live");
     bool RequestStartRecording();
-    bool RequestToggleRecordingPause();
     bool StopRecording();
     bool RequestPlayback(const std::string& url);
     void StopPlayback();
@@ -133,23 +121,7 @@ private:
     std::atomic<bool> connected_{false};
     std::atomic<bool> audio_connected_{false};
     std::atomic<bool> recording_{false};
-    std::atomic<bool> capture_paused_{false};
-    std::atomic<bool> pause_toggle_pending_{false};
     std::atomic<uint32_t> capture_generation_{0};
-    struct CaptureTransition {
-        uint64_t id = 0;
-        uint32_t epoch = 0;
-        std::string recording_id;
-        int revision = -1;
-        std::string boot_id;
-        std::string session_id;
-        bool paused = false;
-        bool acknowledged = false;
-        bool success = false;
-    };
-    std::mutex capture_transition_mutex_;
-    uint64_t capture_transition_sequence_ = 0;
-    CaptureTransition pending_capture_transition_;
     std::string recording_mode_ = "idle";
     uint64_t boot_id_ = 0;
     uint64_t audio_sequence_ = 0;
@@ -192,10 +164,7 @@ private:
     void MaybeRenewRecordingLease();
     void AppendRecordingIdentity(cJSON* root) const;
     void AppendCaptureIdentity(cJSON* root) const;  // Caller holds recording_mutex_.
-    bool ToggleRecordingPause(uint32_t authorized_epoch, uint32_t capture_generation);
-    bool SendCaptureTransition(bool paused, uint64_t cutoff = 0);
-    void HandleCaptureTransitionAck(const cJSON* root, uint32_t epoch);
-    uint64_t CaptureSampleEnd();  // Caller has completed the input stop barrier.
+    uint64_t CaptureSampleEnd();                    // Caller has completed the input stop barrier.
     void SetUserState(UserState state);
     bool RetransmitAudioLocked();
     void EnsureUsbProvisioningTask();

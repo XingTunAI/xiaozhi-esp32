@@ -75,7 +75,7 @@ public:
 
 private:
     enum class NetworkStatus { Connecting, Connected, Disconnected, Configuring };
-    enum class Indicator { Unknown, Connecting, Configuring, Ready, Recording, Paused, Error };
+    enum class Indicator { Unknown, Connecting, Configuring, Ready, Recording, Error };
 
     static const char* IndicatorName(Indicator state) {
         switch (state) {
@@ -87,8 +87,6 @@ private:
                 return "ready";
             case Indicator::Recording:
                 return "recording";
-            case Indicator::Paused:
-                return "paused";
             case Indicator::Error:
                 return "error";
             default:
@@ -104,12 +102,6 @@ private:
     Indicator SelectIndicator() const {
         auto& client = VoiceLabClient::GetInstance();
         auto user_state = client.GetUserState();
-        if (user_state == VoiceLabClient::UserState::Paused) {
-            return Indicator::Paused;
-        }
-        if (user_state == VoiceLabClient::UserState::Pausing) {
-            return Indicator::Connecting;
-        }
         if (client.IsRecording()) {
             return Indicator::Recording;
         }
@@ -163,9 +155,6 @@ private:
                 case Indicator::Recording:
                     SetAllColor({0, 0, 32});
                     break;
-                case Indicator::Paused:
-                    SetAllColor({24, 16, 0});
-                    break;
                 case Indicator::Error:
                     SetAllColor({32, 0, 0});
                     Blink({32, 0, 0}, 500);
@@ -203,16 +192,8 @@ public:
     }
 
     // The expander scanner dispatches these methods on the application task.
-    void OnPrimaryClick() {
-        auto& client = VoiceLabClient::GetInstance();
-        if (client.IsRecording()) {
-            if (!action_pending_) {
-                RunWorker(Action::TogglePause);
-            }
-        } else {
-            ShowHint("长按 K2 2 秒开始录音；录音中短按暂停或继续");
-        }
-    }
+    // Short presses do not change capture or play sound into a recording.
+    void OnPrimaryClick() { ShowHint("长按 K2 2 秒开始或结束录音"); }
 
     void OnPrimaryLongPress() {
         auto& client = VoiceLabClient::GetInstance();
@@ -245,7 +226,7 @@ public:
     }
 
 private:
-    enum class Action { Stop, Reconfigure, RequestStart, TogglePause };
+    enum class Action { Stop, Reconfigure, RequestStart };
     std::function<void()> enter_wifi_;
     std::atomic<bool> long_press_handled_{false};
     // Only the application task changes action scheduling. One worker handles
@@ -292,9 +273,7 @@ private:
                 const auto action = controls->worker_action_;
                 auto& client = VoiceLabClient::GetInstance();
                 const bool success = action == Action::RequestStart ? client.RequestStartRecording()
-                                     : action == Action::TogglePause
-                                         ? client.RequestToggleRecordingPause()
-                                         : client.StopRecording();
+                                                                    : client.StopRecording();
                 if (action == Action::Reconfigure) {
                     client.StopPlayback();
                     client.Disconnect();
@@ -312,9 +291,6 @@ private:
                         } else if (!VoiceLabClient::GetInstance().IsRecording()) {
                             ShowHint("已请求开始，请等待设备确认");
                         }
-                    } else if (action == Action::TogglePause) {
-                        if (!success)
-                            ShowHint("暂停或继续未完成，请查看设备状态");
                     } else if (success && !VoiceLabClient::GetInstance().IsRecording()) {
                         ShowHint("录音已停止；长按 K2 或在网页开始下一次录音");
                     } else if (!success) {

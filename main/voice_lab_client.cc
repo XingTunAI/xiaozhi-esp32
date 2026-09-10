@@ -88,7 +88,6 @@ constexpr int kTlsTimeWaitMs = 15000;
 // timely renewals and enforce any positive total duration granted by the server.
 constexpr int64_t kControlSilenceLimitUs = 15LL * 1000000;
 constexpr int kAudioAcceptTimeoutMs = 5000;
-constexpr int kCaptureTransitionAckTimeoutMs = 10000;
 constexpr int kAudioDrainTimeoutMs = 10000;
 std::atomic<bool> g_usb_provisioning_task_started{false};
 std::atomic<bool> g_sntp_started{false};
@@ -675,12 +674,6 @@ void VoiceLabClient::SetUserState(UserState state) {
             case UserState::Recording:
                 display->SetStatus("正在录音");
                 break;
-            case UserState::Paused:
-                display->SetStatus("录音已暂停，再次短按继续");
-                break;
-            case UserState::Pausing:
-                display->SetStatus("正在确认暂停");
-                break;
             case UserState::Stopping:
                 display->SetStatus("已停止采集，正在整理");
                 break;
@@ -699,7 +692,6 @@ void VoiceLabClient::AbortRecording() {
     // No network calls or network mutex: this also runs from the safety timer.
     abort_generation_.fetch_add(1);
     recording_.store(false);
-    capture_paused_.store(false);
     start_request_deadline_us_.store(0);
     interrupted_.store(true);
     Application::GetInstance().GetAudioService().EnableExternalCapture(false);
@@ -726,26 +718,16 @@ bool VoiceLabClient::EnsureControlTask() {
                         ControlMessage message{};
                         // Send newly captured 20 ms frames on the next worker pass;
                         // do not wait for a half-second batch or block the microphone.
-                        const auto wait_ms =
-                            client->recording_.load() && !client->capture_paused_.load() ? 10 : 100;
+                        const auto wait_ms = client->recording_.load() ? 10 : 100;
                         if (xQueueReceive(client->control_queue_, &message,
                                           pdMS_TO_TICKS(wait_ms)) == pdTRUE) {
                             auto* type = cJSON_GetObjectItem(message.json, "type");
-                            const bool toggle_pause =
-                                JsonText(type, "local_toggle_recording_pause");
                             if (message.epoch == client->control_epoch_.load()) {
                                 if (client->handled_control_epoch_ != message.epoch) {
                                     client->recording_guard_.Reset();
                                     client->handled_control_epoch_ = message.epoch;
                                 }
-                                if (toggle_pause) {
-                                    auto* generation =
-                                        cJSON_GetObjectItem(message.json, "captureGeneration");
-                                    if (JsonInteger(generation, 0, UINT32_MAX))
-                                        client->ToggleRecordingPause(
-                                            message.epoch,
-                                            static_cast<uint32_t>(generation->valuedouble));
-                                } else if (strcmp(type->valuestring, "desired_config") == 0) {
+                                if (strcmp(type->valuestring, "desired_config") == 0) {
                                     client->ApplyDesiredConfig(message.json, message.epoch,
                                                                message.received_at_us);
                                 } else if (strcmp(type->valuestring, "recording_request_result") ==
@@ -768,8 +750,6 @@ bool VoiceLabClient::EnsureControlTask() {
                                     }
                                 }
                             }
-                            if (toggle_pause)
-                                client->pause_toggle_pending_.store(false);
                             cJSON_Delete(message.json);
                         }
                         if (client->tail_pending_.load() && !client->recording_.load()) {
@@ -1156,212 +1136,10 @@ bool VoiceLabClient::ApplyRecordingAuthorization(const cJSON* authorization,
     return true;
 }
 
-bool VoiceLabClient::RequestToggleRecordingPause() {
-    const auto generation = capture_generation_.load();
-    const auto state = GetUserState();
-    if (!IsConnected() || !recording_.load() ||
-        (state != UserState::Recording && state != UserState::Paused) || !control_queue_)
-        return false;
-    bool expected = false;
-    if (!pause_toggle_pending_.compare_exchange_strong(expected, true))
-        return false;
-    auto* root = cJSON_CreateObject();
-    if (!root) {
-        pause_toggle_pending_.store(false);
-        return false;
-    }
-    cJSON_AddStringToObject(root, "type", "local_toggle_recording_pause");
-    cJSON_AddNumberToObject(root, "captureGeneration", generation);
-    ControlMessage message{root, control_epoch_.load(), esp_timer_get_time()};
-    if (xQueueSend(control_queue_, &message, 0) != pdTRUE) {
-        cJSON_Delete(root);
-        pause_toggle_pending_.store(false);
-        return false;
-    }
-    return true;
-}
-
 uint64_t VoiceLabClient::CaptureSampleEnd() {
     std::lock_guard<std::mutex> lock(mutex_);
     std::lock_guard<std::mutex> pcm_lock(pcm_mutex_);
     return sample_start_ + pending_audio_pcm_.size() / kAudioChannels;
-}
-
-bool VoiceLabClient::ToggleRecordingPause(uint32_t authorized_epoch, uint32_t capture_generation) {
-    std::lock_guard<std::mutex> operation(recording_mutex_);
-    auto cancelled = [this, authorized_epoch, capture_generation]() {
-        return !recording_.load() || interrupted_.load() || !IsConnected() ||
-               authorized_epoch != control_epoch_.load() ||
-               capture_generation != capture_generation_.load() || session_stop_requested_.load() ||
-               VoiceLabRecordingGuard::StartSuperseded(recording_revision_,
-                                                       latest_idle_revision_.load());
-    };
-    if (cancelled() || !audio_connected_.load())
-        return false;
-    auto& audio = Application::GetInstance().GetAudioService();
-    if (!capture_paused_.load()) {
-        if (!audio.StopExternalCaptureAndWait(1000)) {
-            capture_stop_failed_.store(true);
-            AbortRecording();
-            return false;
-        }
-        if (cancelled())
-            return false;
-        capture_paused_.store(true);
-        SetUserState(UserState::Pausing);
-        const auto cutoff = CaptureSampleEnd();
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            for (int i = 0; i < kMaxPendingPcmFrames; ++i) {
-                if (!FlushPendingAudioLocked()) {
-                    AbortRecording();
-                    return false;
-                }
-            }
-        }
-        // Keep the stream open, but confirm the captured prefix before declaring
-        // a pause on the independently delivered control channel.
-        const auto deadline = esp_timer_get_time() + 2000000;
-        while (!cancelled() && audio_connected_.load() &&
-               acknowledged_sample_end_.load() < cutoff && esp_timer_get_time() < deadline) {
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                if (!RetransmitAudioLocked()) {
-                    AbortRecording();
-                    return false;
-                }
-            }
-            vTaskDelay(pdMS_TO_TICKS(20));
-        }
-        if (cancelled())
-            return false;
-        if (!audio_connected_.load() || acknowledged_sample_end_.load() < cutoff) {
-            AbortRecording();
-            return false;
-        }
-        if (!SendCaptureTransition(true, cutoff))
-            return false;
-        if (cancelled())
-            return false;
-        SetUserState(UserState::Paused);
-        SpeakVoiceLabPrompt(VoiceLabPrompt::RecordingPaused);
-        return !cancelled();
-    }
-
-    // The microphone stays stopped during the resume announcement. Keep the
-    // original session, PCM counters, authorization and lease renewal schedule.
-    if (!SpeakVoiceLabPrompt(VoiceLabPrompt::RecordingResumed) || cancelled())
-        return false;
-    vTaskDelay(pdMS_TO_TICKS(150));
-    if (cancelled() || !audio_connected_.load())
-        return false;
-    if (!SendCaptureTransition(false))
-        return false;
-    first_pcm_received_.store(false);
-    {
-        std::lock_guard<std::mutex> gate(capture_gate_mutex_);
-        if (cancelled())
-            return false;
-        capture_paused_.store(false);
-        audio.EnableExternalCapture(true);
-    }
-    SetUserState(UserState::Recording);
-    const auto deadline = esp_timer_get_time() + 1000000;
-    while (!first_pcm_received_.load() && !cancelled() && esp_timer_get_time() < deadline)
-        vTaskDelay(pdMS_TO_TICKS(10));
-    if (!first_pcm_received_.load()) {
-        AbortRecording();
-        return false;
-    }
-    return !cancelled();
-}
-
-bool VoiceLabClient::SendCaptureTransition(bool paused, uint64_t cutoff) {
-    // Caller holds recording_mutex_, but receive callbacks use only the short
-    // transition mutex so this bounded acknowledgement wait cannot block them.
-    auto* status = cJSON_CreateObject();
-    cJSON_AddStringToObject(status, "type", "status");
-    cJSON_AddStringToObject(status, "mode", recording_mode_.c_str());
-    cJSON_AddStringToObject(status, "captureState", paused ? "paused" : "recording");
-    cJSON_AddBoolToObject(status, "paused", paused);
-    cJSON_AddBoolToObject(status, "recording", !paused);
-    if (paused)
-        cJSON_AddNumberToObject(status, "captureSampleEnd", static_cast<double>(cutoff));
-    AppendCaptureIdentity(status);
-    uint64_t id;
-    {
-        std::lock_guard<std::mutex> lock(capture_transition_mutex_);
-        id = ++capture_transition_sequence_;
-        auto* session = cJSON_GetObjectItem(status, "sessionId");
-        pending_capture_transition_ = {id,
-                                       recording_control_epoch_,
-                                       recording_id_,
-                                       recording_revision_,
-                                       std::to_string(boot_id_),
-                                       cJSON_IsString(session) ? session->valuestring : "",
-                                       paused};
-    }
-    cJSON_AddNumberToObject(status, "transitionId", static_cast<double>(id));
-    const auto json = PrintJson(status);
-    cJSON_Delete(status);
-    const bool sent = SendJson(json, recording_control_epoch_);
-    const auto deadline = esp_timer_get_time() + kCaptureTransitionAckTimeoutMs * 1000LL;
-    bool success = false;
-    while (sent && recording_.load() && !interrupted_.load() &&
-           control_epoch_.load() == recording_control_epoch_ && !session_stop_requested_.load() &&
-           !VoiceLabRecordingGuard::StartSuperseded(recording_revision_,
-                                                    latest_idle_revision_.load()) &&
-           esp_timer_get_time() < deadline) {
-        {
-            std::lock_guard<std::mutex> lock(capture_transition_mutex_);
-            if (pending_capture_transition_.id == id && pending_capture_transition_.acknowledged) {
-                success = pending_capture_transition_.success;
-                break;
-            }
-        }
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-    {
-        std::lock_guard<std::mutex> lock(capture_transition_mutex_);
-        pending_capture_transition_ = {};
-    }
-    if (!success) {
-        // A queued explicit stop will perform normal finalization itself.
-        if (!session_stop_requested_.load() &&
-            !VoiceLabRecordingGuard::StartSuperseded(recording_revision_,
-                                                     latest_idle_revision_.load())) {
-            ESP_LOGW(TAG, "Capture %s acknowledgement failed; stopping capture",
-                     paused ? "pause" : "resume");
-            AbortRecording();
-        }
-        return false;
-    }
-    ESP_LOGI(TAG, "Capture %s acknowledged: transition=%llu", paused ? "pause" : "resume",
-             static_cast<unsigned long long>(id));
-    return true;
-}
-
-void VoiceLabClient::HandleCaptureTransitionAck(const cJSON* root, uint32_t epoch) {
-    std::lock_guard<std::mutex> lock(capture_transition_mutex_);
-    auto& pending = pending_capture_transition_;
-    const auto* id = cJSON_GetObjectItem(root, "transitionId");
-    const auto* revision = cJSON_GetObjectItem(root, "recordingRevision");
-    const auto* paused = cJSON_GetObjectItem(root, "paused");
-    const auto* success = cJSON_GetObjectItem(root, "success");
-    const auto* session = cJSON_GetObjectItem(root, "sessionId");
-    const bool same_session = pending.session_id.empty()
-                                  ? (!session || cJSON_IsNull(session) || JsonText(session, ""))
-                                  : JsonText(session, pending.session_id.c_str());
-    if (!pending.id || pending.acknowledged || pending.epoch != epoch ||
-        epoch != control_epoch_.load() || !JsonInteger(id, 1, 9007199254740991LL) ||
-        static_cast<uint64_t>(id->valuedouble) != pending.id ||
-        !JsonInteger(revision, 0, INT_MAX) || revision->valueint != pending.revision ||
-        !JsonText(cJSON_GetObjectItem(root, "recordingId"), pending.recording_id.c_str()) ||
-        !JsonText(cJSON_GetObjectItem(root, "bootId"), pending.boot_id.c_str()) || !same_session ||
-        !cJSON_IsBool(paused) || cJSON_IsTrue(paused) != pending.paused || !cJSON_IsBool(success))
-        return;
-    pending.success = cJSON_IsTrue(success);
-    pending.acknowledged = true;
 }
 
 void VoiceLabClient::AppendRecordingIdentity(cJSON* root) const {
@@ -1458,7 +1236,6 @@ bool VoiceLabClient::StartAuthorizedRecording(const std::string& recording_id,
     recording_id_ = recording_id;
     recording_revision_ = revision;
     capture_generation_.fetch_add(1);
-    capture_paused_.store(false);
     active_revision_.store(revision);
     SetUserState(UserState::Starting);
     auto& audio_service = Application::GetInstance().GetAudioService();
@@ -1610,7 +1387,6 @@ bool VoiceLabClient::StopRecording() {
     const bool capture_stopped = audio_service.StopExternalCaptureAndWait(1000);
     capture_stop_failed_.store(!capture_stopped);
     recording_.store(false);
-    capture_paused_.store(false);
     recording_deadline_us_.store(0);
     recording_mode_ = "idle";
     if (!capture_stopped)
@@ -1747,7 +1523,7 @@ void VoiceLabClient::NotifyRecordingStarted() {
 }
 
 bool VoiceLabClient::SendPcmAudio(std::vector<int16_t>&& pcm) {
-    if (!recording_.load() || capture_paused_.load()) {
+    if (!recording_.load()) {
         return false;
     }
     if (pcm.empty() || pcm.size() % kPcmSamplesPerFrame != 0) {
@@ -1762,7 +1538,7 @@ bool VoiceLabClient::SendPcmAudio(std::vector<int16_t>&& pcm) {
         return false;
     }
 
-    if (!recording_.load() || capture_paused_.load()) {
+    if (!recording_.load()) {
         return false;
     }
     if (pending_audio_pcm_.size() + pcm.size() >
@@ -2018,10 +1794,6 @@ void VoiceLabClient::HandleJson(const cJSON* root) {
         return;
     }
     last_control_rx_us_.store(esp_timer_get_time());
-    if (strcmp(type->valuestring, "recording_pause_ack") == 0) {
-        HandleCaptureTransitionAck(root, control_epoch_.load());
-        return;
-    }
     if (strcmp(type->valuestring, "recording_lease") == 0) {
         HandleRecordingResponse(root);
         return;
@@ -2127,9 +1899,10 @@ std::string VoiceLabClient::GetStatusJson() const {
     cJSON* root = cJSON_CreateObject();
     cJSON_AddBoolToObject(root, "connected", IsConnected());
     cJSON_AddBoolToObject(root, "audio_connected", audio_connected_.load());
-    cJSON_AddBoolToObject(root, "recording", recording_.load() && !capture_paused_.load());
+    cJSON_AddBoolToObject(root, "recording", recording_.load());
     cJSON_AddBoolToObject(root, "recording_session_active", recording_.load());
-    cJSON_AddBoolToObject(root, "paused", capture_paused_.load());
+    cJSON_AddBoolToObject(root, "paused",
+                          false);  // Compatibility with existing server status readers.
     cJSON_AddBoolToObject(root, "audio_finalization_pending",
                           tail_pending_.load() && !recording_.load());
     cJSON_AddBoolToObject(root, "interrupted", interrupted_.load());
