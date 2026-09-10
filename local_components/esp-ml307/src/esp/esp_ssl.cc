@@ -2,6 +2,7 @@
 #include <esp_crt_bundle.h>
 #include <esp_log.h>
 #include <mbedtls/ssl_ciphersuites.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <cstdlib>
@@ -61,6 +62,18 @@ bool EspSsl::Connect(const std::string& host, int port) {
         return false;
     }
 
+#if CONFIG_VOICE_LAB_STANDALONE_MODE
+    // PCM is delivered in small real-time frames. Do not hold a frame behind
+    // Nagle's algorithm while waiting for acknowledgement of an earlier write.
+    int sockfd = -1;
+    const int no_delay = 1;
+    if (esp_tls_get_conn_sockfd(tls_client_, &sockfd) != ESP_OK || sockfd < 0 ||
+        setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &no_delay, sizeof(no_delay)) != 0) {
+        ESP_LOGW(TAG, "Unable to enable TCP_NODELAY: errno=%d", errno);
+    } else {
+        ESP_LOGI(TAG, "TCP_NODELAY enabled for realtime transport");
+    }
+#endif
     connected_ = true;
 
     receive_exited_.store(false);

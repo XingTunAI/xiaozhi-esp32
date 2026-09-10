@@ -90,7 +90,6 @@ constexpr int64_t kControlSilenceLimitUs = 15LL * 1000000;
 constexpr int kAudioAcceptTimeoutMs = 5000;
 constexpr int kCaptureTransitionAckTimeoutMs = 10000;
 constexpr int kAudioDrainTimeoutMs = 10000;
-constexpr size_t kMaxUnacknowledgedPackets = 8;  // Four seconds of PCM, bounded.
 std::atomic<bool> g_usb_provisioning_task_started{false};
 std::atomic<bool> g_sntp_started{false};
 
@@ -657,7 +656,8 @@ void VoiceLabClient::SetUserState(UserState state) {
         // so it must own the Wi-Fi performance lifecycle itself. Keep the link
         // awake through pause and final audio confirmation as well.
         const auto current_state = user_state_.load();
-        const bool idle = current_state == UserState::Ready || current_state == UserState::Error;
+        const bool idle = !tail_pending_.load() &&
+                          (current_state == UserState::Ready || current_state == UserState::Error);
         board.SetPowerSaveLevel(idle ? PowerSaveLevel::LOW_POWER : PowerSaveLevel::PERFORMANCE);
         auto* display = board.GetDisplay();
         if (!display)
@@ -724,8 +724,12 @@ bool VoiceLabClient::EnsureControlTask() {
                     auto* client = static_cast<VoiceLabClient*>(arg);
                     while (true) {
                         ControlMessage message{};
-                        if (xQueueReceive(client->control_queue_, &message, pdMS_TO_TICKS(100)) ==
-                            pdTRUE) {
+                        // Send newly captured 20 ms frames on the next worker pass;
+                        // do not wait for a half-second batch or block the microphone.
+                        const auto wait_ms =
+                            client->recording_.load() && !client->capture_paused_.load() ? 10 : 100;
+                        if (xQueueReceive(client->control_queue_, &message,
+                                          pdMS_TO_TICKS(wait_ms)) == pdTRUE) {
                             auto* type = cJSON_GetObjectItem(message.json, "type");
                             const bool toggle_pause =
                                 JsonText(type, "local_toggle_recording_pause");
@@ -774,7 +778,7 @@ bool VoiceLabClient::EnsureControlTask() {
                             client->MaybeRenewRecordingLease();
                             std::lock_guard<std::mutex> lock(client->mutex_);
                             for (int i = 0; i < 2 && client->recording_.load(); ++i) {
-                                if (!client->FlushPendingAudioLocked(false))
+                                if (!client->FlushPendingAudioLocked())
                                     break;
                             }
                             if (!client->RetransmitAudioLocked())
@@ -1209,7 +1213,7 @@ bool VoiceLabClient::ToggleRecordingPause(uint32_t authorized_epoch, uint32_t ca
         {
             std::lock_guard<std::mutex> lock(mutex_);
             for (int i = 0; i < kMaxPendingPcmPackets; ++i) {
-                if (!FlushPendingAudioLocked(true)) {
+                if (!FlushPendingAudioLocked()) {
                     AbortRecording();
                     return false;
                 }
@@ -1635,7 +1639,7 @@ bool VoiceLabClient::StopRecording() {
         std::lock_guard<std::mutex> lock(mutex_);
         if (audio_websocket_ != nullptr && audio_websocket_->IsConnected()) {
             for (int i = 0; i < kMaxPendingPcmPackets; ++i) {
-                if (!FlushPendingAudioLocked(true)) {
+                if (!FlushPendingAudioLocked()) {
                     interrupted_.store(true);
                     break;
                 }
@@ -1770,12 +1774,13 @@ bool VoiceLabClient::SendPcmAudio(std::vector<int16_t>&& pcm) {
     }
     pending_audio_pcm_.insert(pending_audio_pcm_.end(), pcm.begin(), pcm.end());
     first_pcm_received_.store(true);
-    // The control worker transmits batches. Never perform socket I/O in the
+    // The control worker sends available frames without waiting to fill a batch.
+    // Never perform socket I/O in the
     // microphone task, including when a server stops acknowledging audio.
     return true;
 }
 
-bool VoiceLabClient::FlushPendingAudioLocked(bool force) {
+bool VoiceLabClient::FlushPendingAudioLocked() {
     std::unique_lock<std::mutex> pcm_lock(pcm_mutex_);
     if (pending_audio_pcm_.empty()) {
         return true;
@@ -1783,8 +1788,7 @@ bool VoiceLabClient::FlushPendingAudioLocked(bool force) {
     const size_t pending_frames = pending_audio_pcm_.size() / kPcmSamplesPerFrame;
     const size_t frames_to_send =
         std::min(pending_frames, static_cast<size_t>(kMaxFramesPerPacket));
-    if (frames_to_send == 0 ||
-        (!force && frames_to_send < static_cast<size_t>(kMaxFramesPerPacket))) {
+    if (frames_to_send == 0) {
         return true;
     }
     if (audio_websocket_ == nullptr || !audio_websocket_->IsConnected()) {
@@ -1795,13 +1799,15 @@ bool VoiceLabClient::FlushPendingAudioLocked(bool force) {
            unacknowledged_audio_.front().sample_end <= acknowledged_sample_end_.load()) {
         unacknowledged_audio_.pop_front();
     }
-    if (unacknowledged_audio_.size() >= kMaxUnacknowledgedPackets) {
+    const size_t samples_to_send = frames_to_send * kPcmSamplesPerFrame;
+    const auto acknowledged = acknowledged_sample_end_.load();
+    const auto outstanding = sample_start_ > acknowledged ? sample_start_ - acknowledged : 0;
+    if (outstanding + samples_to_send > kMaxUnacknowledgedSamples) {
         ESP_LOGW(TAG, "Voice Lab acknowledgement buffer full; stopping capture");
         AbortRecording();
         return false;
     }
 
-    const size_t samples_to_send = frames_to_send * kPcmSamplesPerFrame;
     std::vector<int16_t> batch(pending_audio_pcm_.begin(),
                                pending_audio_pcm_.begin() + samples_to_send);
     pending_audio_pcm_.erase(pending_audio_pcm_.begin(),
