@@ -201,3 +201,16 @@ python scripts\build.py waveshare/esp32-s3-audio-board --name esp32-s3-audio-boa
 日志：`../tools/waveshare-tests-lease-2026-09-09.log`、`../tools/waveshare-build-lease-2026-09-09.log`、`../tools/waveshare-build-lease-final-2026-09-09.log`、`../tools/waveshare-display-build-lease-2026-09-09.log`。
 
 截止点补充后的复测日志：`../tools/waveshare-tests-lease-cutoff-2026-09-09.log`、`../tools/waveshare-build-lease-cutoff-2026-09-09.log`、`../tools/waveshare-display-build-lease-cutoff-2026-09-09.log`。80 项主机测试与两分支构建再次通过，仍未烧录。
+
+## 2026-09-10 租约固件实机更新
+
+用户授权后，已将上述租约应用烧录到 COM30 的 Waveshare 样机（MAC 尾号 `B2:AD:EC`）。本节取代上节“未烧录”的当前状态，保留上节作为历史构建记录。
+
+- 固件源码提交 `97c9a8fa95777149b735efd07a6db9b6e939e852`；应用 SHA-256 为 `4d7ec3c4c536ec43fcdc433ba275f574c7db0a20c1fb06eb69bf9a315100ce32`，大小 2443136 字节。
+- 仅写入 `0x20000` 应用段，写入后哈希校验通过；未擦除或写入 NVS、分区表及其他串口设备。
+- 重启后自动连回已保存的 Wi-Fi 和 `wss://voice-lab.cloud:1883`，进入待机；服务器收到 `recordingControlVersion=1`。
+- 启动日志 ELF SHA-256 为 `fea2bc92626c3c7ed326735203878cda9f408cebb146192df3f015e932e35c57`。新旧构建描述时间相同，不能用该时间判断是否更新成功。
+- 排查开始录音红灯时，发现服务端在约 3 秒重试后强制断开，而设备启动提示与音频连接需要更长时间。配套服务端已延长为完整 12 秒确认窗口，并修正重连先同步待机及控制/音频 bootId 的格式比较。
+- 本次遵照用户要求未重复本地主机测试。烧录和联网检查已完成，K2 开始/停止及实际音频仍以本次现场验收结果为准。
+
+烧录与启动日志：`../tools/waveshare-flash-lease-2026-09-10.log`、`../tools/waveshare-boot-lease-2026-09-10.log`；开始失败诊断日志：`../tools/waveshare-start-diagnosis-2026-09-10.log`、`../tools/waveshare-start-diagnosis2-2026-09-10.log`。后续串口观察使用只读监视器，不向诊断 USB 端口写命令或触发复位。
