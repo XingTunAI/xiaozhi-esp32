@@ -13,6 +13,7 @@
 #include <esp_app_desc.h>
 #include <esp_heap_caps.h>
 #include <esp_log.h>
+#include <esp_rom_sys.h>
 #include <esp_sntp.h>
 #include <esp_system.h>
 #include <esp_timer.h>
@@ -708,6 +709,18 @@ void VoiceLabClient::NotifyNetworkDisconnected() {
 
 bool VoiceLabClient::EnsureControlTask() {
     static const bool ready = [this]() {
+#if CONFIG_VOICE_LAB_STANDALONE_MODE
+        // The failure hook must not allocate memory or use buffered logging.
+        ESP_ERROR_CHECK(heap_caps_register_failed_alloc_callback([](size_t bytes, uint32_t caps,
+                                                                    const char* function) {
+            esp_rom_printf(
+                "VoiceLab allocation failed: bytes=%u caps=0x%x dma_free=%u "
+                "dma_largest=%u function=%s\n",
+                static_cast<unsigned>(bytes), static_cast<unsigned>(caps),
+                static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)),
+                static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)), function);
+        }));
+#endif
         control_queue_ = xQueueCreate(8, sizeof(ControlMessage));
         if (!control_queue_)
             return false;
@@ -1621,11 +1634,15 @@ bool VoiceLabClient::FlushPendingAudioLocked() {
     auto now = static_cast<uint64_t>(esp_timer_get_time());
     if (now - last_audio_stats_us_ >= 1000000) {
         ESP_LOGI(TAG,
-                 "Voice Lab PCM sent: frames=%llu bytes=%llu sample_start=%llu pending_frames=%u",
+                 "Voice Lab PCM sent: frames=%llu bytes=%llu sample_start=%llu pending_frames=%u "
+                 "dma_free=%u dma_min=%u dma_largest=%u",
                  static_cast<unsigned long long>(audio_frames_sent_),
                  static_cast<unsigned long long>(audio_bytes_sent_),
                  static_cast<unsigned long long>(sample_start_),
-                 static_cast<unsigned>(remaining_frames));
+                 static_cast<unsigned>(remaining_frames),
+                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)),
+                 static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_DMA)),
+                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)));
         last_audio_stats_us_ = now;
     }
     return true;

@@ -17,3 +17,9 @@ Standalone ESP TLS 连接启用 TCP_NODELAY。录音发生错误但仍在发送�
 进一步将此变体的 TCP 发送容量从 5760 调至 32768 字节，接收窗口从 5760 调至 16384，TCP 接收邮箱相应设为 14（窗口/MSS 向上取整再加 2）。目的是让 TLS 小帧在存在往返延迟时保持足够在途容量，不增加发送前等待。PCM 采集缓冲和未确认样本上限仍为四秒。该版本仍需重新构建、烧录和连续录音验证。
 
 2026-09-10 用户确认首版移除暂停/继续。已删除固件暂停状态、切换请求和确认等待，K2 短按不影响录音，长按仍开始/结束。服务端保留旧固件的协议兼容，新固件仅报告 paused=false。此改动不等于已经解决网络发送积压，必须单独真机验收。
+
+`4f6fc53` 真机保存 123.36 秒后中断（测试 `5b5dd96a-6cc8-4367-b71c-e704103e0027`）。发送队列没有积压，实际故障是 `esp-aes: Failed to allocate memory`，随后 TLS 写入返回 `-0x0084`；内部内存历史低点降到 600 字节。扩大 TCP 在途容量后必须同时调整网络内存分配，不能继续靠提高容量解决。
+
+后续无屏变体启用 `SPIRAM_TRY_ALLOCATE_WIFI_LWIP`，允许网络普通缓冲优先使用现有 PSRAM；Wi-Fi DMA 发送使用启动时分配的 16 个固定缓冲，另有 32 个受限发送缓存。依据本机 IDF v6.1 的 `esp_wifi/Kconfig`，PSRAM 场景应选择静态 TX，避免运行中动态抢占加密 DMA 内存。保持原加密协议和硬件 AES；添加每秒 DMA 可用量、历史最低值、最大连续块及不分配内存的分配失败回调诊断。录音不写设备 Flash，仍需重新烧录及连续验收。
+
+[乐鑫 FAQ](https://docs.espressif.com/projects/esp-faq/en/latest/software-framework/wifi.html#how-to-handle-the-issue-esp-aes-failed-to-allocate-memory) 将此错误归为 DMA 内存分配失败，建议检查 DMA 内存并减少其他功能占用。
