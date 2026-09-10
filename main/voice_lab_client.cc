@@ -579,6 +579,13 @@ bool VoiceLabClient::ConnectAudioLocked(const std::string& url, const std::strin
     audio_websocket_->SetHeader("Device-Id", SystemInfo::GetMacAddress().c_str());
     audio_websocket_->SetHeader("Client-Id", Board::GetInstance().GetUuid().c_str());
     audio_websocket_->SetHeader("Voice-Lab-Audio-Protocol", kAudioProtocol);
+    if (recording_revision_ >= 0) {
+        audio_websocket_->SetHeader("Voice-Lab-Capture-Ready", "1");
+        audio_websocket_->SetHeader("Voice-Lab-Recording-Id", recording_id_.c_str());
+        audio_websocket_->SetHeader("Voice-Lab-Revision",
+                                    std::to_string(recording_revision_).c_str());
+        audio_websocket_->SetHeader("Voice-Lab-Boot-Id", std::to_string(boot_id_).c_str());
+    }
     audio_websocket_->SetReceiveBufferSize(2048);
 
     audio_websocket_->OnData([this](const char* data, size_t len, bool binary) {
@@ -1235,7 +1242,7 @@ void VoiceLabClient::MaybeRenewRecordingLease() {
 bool VoiceLabClient::StartAuthorizedRecording(const std::string& recording_id,
                                               const std::string& mode, int revision,
                                               uint32_t authorized_epoch, const cJSON* authorization,
-                                              int64_t received_at_us) {
+                                              int64_t received_at_us, const cJSON* capture_plan) {
     std::lock_guard<std::mutex> operation(recording_mutex_);
     if (authorized_epoch != control_epoch_.load() || !IsConnected() || recording_.load() ||
         tail_pending_.load())
@@ -1280,6 +1287,10 @@ bool VoiceLabClient::StartAuthorizedRecording(const std::string& recording_id,
         return false;
     }
 
+    // Confirm the prepared capture configuration while the microphone is still
+    // closed. The media socket must then echo server readiness for this command.
+    if (revision >= 0)
+        SendConfigAck(epoch, revision, mode, capture_plan, true);
     auto device_key = GetDeviceKey();
     auto token = GetDeviceToken();
     auto audio_url = BuildWebsocketUrl("/api/v1/devices/" + device_key + "/audio");
@@ -1788,7 +1799,7 @@ void VoiceLabClient::ApplyDesiredConfig(const cJSON* root, uint32_t authorized_e
         }
         bool started = StartAuthorizedRecording(
             recording_id, applied_mode, revision, authorized_epoch,
-            cJSON_GetObjectItem(root, "recordingAuthorization"), received_at_us);
+            cJSON_GetObjectItem(root, "recordingAuthorization"), received_at_us, capture_plan);
         if (authorized_epoch != control_epoch_.load())
             return;  // Never acknowledge an old command on a new connection.
         SendConfigAck(authorized_epoch, revision, started ? applied_mode : "idle", capture_plan,
@@ -1899,9 +1910,24 @@ void VoiceLabClient::HandleAudioJson(const cJSON* root) {
     auto status = cJSON_GetObjectItem(root, "status");
     if (cJSON_IsString(status)) {
         ESP_LOGI(TAG, "Voice Lab audio status: %s", status->valuestring);
-        if (strcmp(status->valuestring, "accepted") == 0)
-            audio_accepted_.store(true);
-        else if (strcmp(status->valuestring, "completed") == 0) {
+        if (strcmp(status->valuestring, "accepted") == 0) {
+            const auto* ready = cJSON_GetObjectItem(root, "captureReadyVersion");
+            const auto* revision = cJSON_GetObjectItem(root, "revision");
+            const bool matches =
+                recording_revision_ < 0 ||
+                (JsonInteger(ready, 1, 1) &&
+                 JsonInteger(revision, recording_revision_, recording_revision_) &&
+                 JsonText(cJSON_GetObjectItem(root, "recordingId"), recording_id_.c_str()) &&
+                 JsonText(cJSON_GetObjectItem(root, "bootId"), std::to_string(boot_id_).c_str()));
+            if (matches) {
+                ESP_LOGI(TAG, "Server capture ready: revision=%d; microphone may start",
+                         recording_revision_);
+                audio_accepted_.store(true);
+            } else {
+                ESP_LOGW(TAG, "Server capture readiness identity mismatch");
+                AbortRecording();
+            }
+        } else if (strcmp(status->valuestring, "completed") == 0) {
             audio_completed_.store(true);
             if (recording_.load())
                 AbortRecording();

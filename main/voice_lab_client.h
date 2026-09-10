@@ -158,7 +158,8 @@ private:
     bool EnsureControlTask();
     bool StartAuthorizedRecording(const std::string& recording_id, const std::string& mode,
                                   int revision, uint32_t authorized_epoch,
-                                  const cJSON* authorization = nullptr, int64_t received_at_us = 0);
+                                  const cJSON* authorization = nullptr, int64_t received_at_us = 0,
+                                  const cJSON* capture_plan = nullptr);
     bool ApplyRecordingAuthorization(const cJSON* authorization, int64_t received_at_us);
     void HandleRecordingResponse(const cJSON* root);
     void MaybeRenewRecordingLease();
