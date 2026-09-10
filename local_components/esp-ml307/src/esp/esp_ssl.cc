@@ -1,0 +1,189 @@
+#include "esp_ssl.h"
+#include <esp_crt_bundle.h>
+#include <esp_log.h>
+#include <mbedtls/ssl_ciphersuites.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <cstdlib>
+#include <cstring>
+
+static const char* TAG = "EspSsl";
+
+EspSsl::EspSsl() = default;
+
+EspSsl::~EspSsl() {
+    if (InReceiveTask()) {
+        ESP_LOGE(TAG, "TLS owner must defer destruction outside its receive callback");
+        abort();
+    }
+    Disconnect();
+}
+
+bool EspSsl::Connect(const std::string& host, int port) {
+    std::lock_guard<std::mutex> lifecycle(lifecycle_mutex_);
+    if (tls_client_ != nullptr) {
+        ESP_LOGE(TAG, "tls client has been initialized");
+        return false;
+    }
+
+    tls_client_ = esp_tls_init();
+    if (tls_client_ == nullptr) {
+        ESP_LOGE(TAG, "Failed to initialize TLS");
+        return false;
+    }
+
+    esp_tls_cfg_t cfg = {};
+    static const int ciphersuites[] = {
+        MBEDTLS_TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+        0,
+    };
+    cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    cfg.common_name = host.c_str();
+    cfg.timeout_ms = 10000;
+    cfg.tls_version = ESP_TLS_VER_TLS_1_2;
+    cfg.ciphersuites_list = ciphersuites;
+
+    int ret = esp_tls_conn_new_sync(host.c_str(), host.length(), port, &cfg, tls_client_);
+    if (ret != 1) {
+        esp_tls_error_handle_t last_error;
+        if (esp_tls_get_error_handle(tls_client_, &last_error) == ESP_OK) {
+            int error_code, error_flags;
+            esp_err_t err = esp_tls_get_and_clear_last_error(last_error, &error_code, &error_flags);
+            last_error_ = err;
+            ESP_LOGE(TAG, "Failed to connect to %s:%d, esp=0x%x, tls=0x%x, flags=0x%x",
+                     host.c_str(), port, err, error_code, error_flags);
+        } else {
+            last_error_ = -1;
+            ESP_LOGE(TAG, "Failed to get error handle");
+        }
+        esp_tls_conn_destroy(tls_client_);
+        tls_client_ = nullptr;
+        return false;
+    }
+
+    connected_ = true;
+
+    receive_exited_.store(false);
+    if (xTaskCreate(
+            [](void* arg) {
+                EspSsl* ssl = (EspSsl*)arg;
+                ssl->ReceiveTask();
+                // Last access to ssl. The owner may destroy it as soon as this is true.
+                ssl->receive_exited_.store(true, std::memory_order_release);
+                vTaskDelete(NULL);
+            },
+            "ssl_receive", 4096, this, 1, &receive_task_handle_) != pdPASS) {
+        connected_ = false;
+        receive_exited_.store(true);
+        last_error_ = ESP_ERR_NO_MEM;
+        std::lock_guard<std::mutex> sender(send_mutex_);
+        esp_tls_conn_destroy(tls_client_);
+        tls_client_ = nullptr;
+        return false;
+    }
+    return true;
+}
+
+bool EspSsl::InReceiveTask() const {
+    return !receive_exited_.load(std::memory_order_acquire) &&
+           xTaskGetCurrentTaskHandle() == receive_task_handle_;
+}
+
+void EspSsl::Disconnect() {
+    connected_ = false;
+    // A callback can request shutdown, but only an external owner may join and
+    // destroy this transport. Never wait for the current receive task itself.
+    if (InReceiveTask()) {
+        int sockfd = -1;
+        if (tls_client_ && esp_tls_get_conn_sockfd(tls_client_, &sockfd) == ESP_OK && sockfd >= 0) {
+            shutdown(sockfd, SHUT_RDWR);
+        }
+        return;
+    }
+    std::lock_guard<std::mutex> lifecycle(lifecycle_mutex_);
+    if (tls_client_ != nullptr) {
+        int sockfd = -1;
+        if (esp_tls_get_conn_sockfd(tls_client_, &sockfd) == ESP_OK && sockfd >= 0) {
+            // Wake blocked reads/writes without closing an fd still owned by TLS.
+            shutdown(sockfd, SHUT_RDWR);
+        }
+        const auto started = xTaskGetTickCount();
+        while (!receive_exited_.load(std::memory_order_acquire)) {
+            if (xTaskGetTickCount() - started >= pdMS_TO_TICKS(10000)) {
+                ESP_LOGE(TAG, "TLS receive task did not exit; refusing to free live transport");
+                abort();
+            }
+            vTaskDelay(1);
+        }
+        receive_task_handle_ = nullptr;
+        // Do not hold this lock while joining: the receive task may send a pong.
+        std::lock_guard<std::mutex> sender(send_mutex_);
+        esp_tls_conn_destroy(tls_client_);
+        tls_client_ = nullptr;
+    }
+}
+
+/* CONFIG_MBEDTLS_SSL_RENEGOTIATION should be disabled in sdkconfig.
+ * Otherwise, invalid memory access may be triggered.
+ */
+int EspSsl::Send(const std::string& data) {
+    std::lock_guard<std::mutex> sender(send_mutex_);
+    if (!connected_ || tls_client_ == nullptr) {
+        ESP_LOGE(TAG, "Not connected");
+        return -1;
+    }
+
+    size_t total_sent = 0;
+    size_t data_size = data.size();
+    const char* data_ptr = data.data();
+
+    while (total_sent < data_size) {
+        if (!connected_)
+            return -1;
+        int ret = esp_tls_conn_write(tls_client_, data_ptr + total_sent, data_size - total_sent);
+
+        if (ret == ESP_TLS_ERR_SSL_WANT_WRITE) {
+            continue;
+        }
+
+        if (ret <= 0) {
+            ESP_LOGE(TAG, "SSL send failed: ret=%d, errno=%d", ret, errno);
+            return ret;
+        }
+
+        total_sent += ret;
+    }
+
+    return total_sent;
+}
+
+void EspSsl::ReceiveTask() {
+    std::string data;
+    while (connected_) {
+        data.resize(1500);
+        int ret = esp_tls_conn_read(tls_client_, data.data(), data.size());
+
+        if (ret == ESP_TLS_ERR_SSL_WANT_READ) {
+            continue;
+        }
+
+        if (ret <= 0) {
+            if (ret < 0) {
+                ESP_LOGE(TAG, "SSL receive failed: %d", ret);
+            }
+            connected_ = false;
+            // 接收失败或连接断开时调用断连回调
+            if (disconnect_callback_) {
+                disconnect_callback_();
+            }
+            break;
+        }
+
+        if (stream_callback_) {
+            data.resize(ret);
+            stream_callback_(data);
+        }
+    }
+}
+
+int EspSsl::GetLastError() { return last_error_; }

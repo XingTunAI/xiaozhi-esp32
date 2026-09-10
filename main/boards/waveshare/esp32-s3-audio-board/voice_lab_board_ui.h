@@ -75,7 +75,7 @@ public:
 
 private:
     enum class NetworkStatus { Connecting, Connected, Disconnected, Configuring };
-    enum class Indicator { Unknown, Connecting, Configuring, Ready, Recording, Error };
+    enum class Indicator { Unknown, Connecting, Configuring, Ready, Recording, Paused, Error };
 
     static const char* IndicatorName(Indicator state) {
         switch (state) {
@@ -87,6 +87,8 @@ private:
                 return "ready";
             case Indicator::Recording:
                 return "recording";
+            case Indicator::Paused:
+                return "paused";
             case Indicator::Error:
                 return "error";
             default:
@@ -102,6 +104,12 @@ private:
     Indicator SelectIndicator() const {
         auto& client = VoiceLabClient::GetInstance();
         auto user_state = client.GetUserState();
+        if (user_state == VoiceLabClient::UserState::Paused) {
+            return Indicator::Paused;
+        }
+        if (user_state == VoiceLabClient::UserState::Pausing) {
+            return Indicator::Connecting;
+        }
         if (client.IsRecording()) {
             return Indicator::Recording;
         }
@@ -155,6 +163,9 @@ private:
                 case Indicator::Recording:
                     SetAllColor({0, 0, 32});
                     break;
+                case Indicator::Paused:
+                    SetAllColor({24, 16, 0});
+                    break;
                 case Indicator::Error:
                     SetAllColor({32, 0, 0});
                     Blink({32, 0, 0}, 500);
@@ -193,7 +204,7 @@ public:
                     ShowHint("请用手机连接设备热点完成配网");
                     QueueVoiceLabPrompt(VoiceLabPrompt::WifiSetup);
                 } else if (state == kDeviceStateWifiConfiguring) {
-                    ShowHint("配网已关闭，长按 K2 或 BOOT 3 秒可重新开启");
+                    ShowHint("配网已关闭，长按 BOOT 3 秒可重新开启");
                 } else {
                     ShowHint("请在 Voice Lab 网页开始录音");
                 }
@@ -206,6 +217,17 @@ public:
         auto& client = VoiceLabClient::GetInstance();
         if (client.IsRecording()) {
             if (!action_pending_) {
+                RunWorker(Action::TogglePause);
+            }
+        } else {
+            ShowHint("长按 K2 2 秒开始录音；录音中短按暂停或继续");
+        }
+    }
+
+    void OnPrimaryLongPress() {
+        auto& client = VoiceLabClient::GetInstance();
+        if (client.IsRecording()) {
+            if (!action_pending_) {
                 ShowHint("正在停止录音，请稍候");
                 RunWorker(Action::Stop);
             }
@@ -213,10 +235,10 @@ public:
         }
         auto state = Application::GetInstance().GetDeviceState();
         if (WifiManager::GetInstance().IsConfigMode()) {
-            ShowHint("请先完成手机配网，再按 K2 开始");
+            ShowHint("请先完成手机配网，再长按 K2 开始");
             QueueVoiceLabPrompt(VoiceLabPrompt::WifiSetup);
         } else if (state == kDeviceStateWifiConfiguring) {
-            ShowHint("长按 K2 3 秒重新配网");
+            ShowHint("长按 BOOT 3 秒重新配网");
         } else if (state == kDeviceStateUnknown || state == kDeviceStateUpgrading ||
                    state == kDeviceStateFatalError) {
             ShowHint("设备当前无法开始录音，请稍后重试");
@@ -232,10 +254,8 @@ public:
         }
     }
 
-    void OnPrimaryLongPress() { RequestWifiConfig(); }
-
 private:
-    enum class Action { Stop, Reconfigure, RequestStart };
+    enum class Action { Stop, Reconfigure, RequestStart, TogglePause };
     std::function<void()> enter_wifi_;
     std::atomic<bool> long_press_handled_{false};
     // Only the application task changes action scheduling. One worker handles
@@ -282,7 +302,9 @@ private:
                 const auto action = controls->worker_action_;
                 auto& client = VoiceLabClient::GetInstance();
                 const bool success = action == Action::RequestStart ? client.RequestStartRecording()
-                                                                    : client.StopRecording();
+                                     : action == Action::TogglePause
+                                         ? client.RequestToggleRecordingPause()
+                                         : client.StopRecording();
                 if (action == Action::Reconfigure) {
                     client.StopPlayback();
                     client.Disconnect();
@@ -300,8 +322,11 @@ private:
                         } else if (!VoiceLabClient::GetInstance().IsRecording()) {
                             ShowHint("已请求开始，请等待设备确认");
                         }
+                    } else if (action == Action::TogglePause) {
+                        if (!success)
+                            ShowHint("暂停或继续未完成，请查看设备状态");
                     } else if (success && !VoiceLabClient::GetInstance().IsRecording()) {
-                        ShowHint("录音已停止；按 K2 或在网页开始下一次录音");
+                        ShowHint("录音已停止；长按 K2 或在网页开始下一次录音");
                     } else if (!success) {
                         ShowHint("录音已中断，请在网页检查结果");
                     }

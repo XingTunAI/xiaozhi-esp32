@@ -12,15 +12,20 @@ public:
     }
 
     static constexpr bool ValidDuration(int64_t lease_ms, int64_t maximum_ms) {
-        return lease_ms >= 1000 && lease_ms <= 30000 && maximum_ms >= 60000 &&
-               maximum_ms <= 3600000;
+        return lease_ms >= 1000 && lease_ms <= 30000 &&
+               (maximum_ms == 0 || (maximum_ms >= 60000 && maximum_ms <= 3600000));
+    }
+
+    // Zero disables an absolute time limit, never the renewable lease itself.
+    static constexpr bool DeadlineExpired(int64_t deadline, int64_t now) {
+        return deadline > 0 && now >= deadline;
     }
 
     constexpr bool Begin(int64_t received_at, int64_t now, int64_t lease_ms, int64_t maximum_ms) {
         if (!ValidDuration(lease_ms, maximum_ms) || received_at < 0 || now < received_at ||
             now >= received_at + lease_ms * 1000)
             return false;
-        maximum_deadline_ = received_at + maximum_ms * 1000;
+        maximum_deadline_ = maximum_ms > 0 ? received_at + maximum_ms * 1000 : 0;
         deadline_ = received_at + lease_ms * 1000;
         next_renewal_at_ = received_at + RenewalInterval(lease_ms);
         pending_id_ = 0;
@@ -34,7 +39,7 @@ public:
     }
 
     constexpr bool Active() const { return deadline_ > 0; }
-    constexpr bool Expired(int64_t now) const { return Active() && now >= deadline_; }
+    constexpr bool Expired(int64_t now) const { return DeadlineExpired(deadline_, now); }
     constexpr int64_t Deadline() const { return deadline_; }
     constexpr int64_t MaximumDeadline() const { return maximum_deadline_; }
 
@@ -56,7 +61,8 @@ public:
             return false;
         // Delay on the wire never grants extra capture time. A response can
         // shorten a lease, but a duplicate cannot extend it again.
-        deadline_ = proposed < maximum_deadline_ ? proposed : maximum_deadline_;
+        deadline_ =
+            maximum_deadline_ > 0 && proposed > maximum_deadline_ ? maximum_deadline_ : proposed;
         pending_id_ = 0;
         next_renewal_at_ = pending_sent_at_ + RenewalInterval(lease_ms);
         return true;

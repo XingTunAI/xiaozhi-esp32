@@ -6,6 +6,8 @@ enum class VoiceLabPrompt {
     Connected,
     RecordingStarted,
     RecordingStopped,
+    RecordingPaused,
+    RecordingResumed,
     StartRequested,
     StartFailed,
     Interrupted

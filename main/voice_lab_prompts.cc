@@ -24,7 +24,12 @@ bool SpeakVoiceLabPrompt(VoiceLabPrompt prompt) {
 #if CONFIG_VOICE_LAB_STANDALONE_MODE
     std::lock_guard<std::mutex> lock(prompt_mutex);
     auto& client = VoiceLabClient::GetInstance();
-    if (client.IsRecording())
+    const bool pause_prompt =
+        prompt == VoiceLabPrompt::RecordingPaused || prompt == VoiceLabPrompt::RecordingResumed;
+    if (pause_prompt &&
+        (client.GetUserState() != VoiceLabClient::UserState::Paused || !client.IsCapturePaused()))
+        return false;
+    if (client.IsRecording() && !pause_prompt)
         return false;
     if (prompt == VoiceLabPrompt::StartRequested &&
         client.GetUserState() != VoiceLabClient::UserState::Requesting)
@@ -69,6 +74,12 @@ bool SpeakVoiceLabPrompt(VoiceLabPrompt prompt) {
             break;
         case VoiceLabPrompt::RecordingStopped:
             sound = Lang::Sounds::OGG_VL_RECORDING_STOP;
+            break;
+        case VoiceLabPrompt::RecordingPaused:
+            sound = Lang::Sounds::OGG_VL_RECORDING_PAUSE;
+            break;
+        case VoiceLabPrompt::RecordingResumed:
+            sound = Lang::Sounds::OGG_VL_RECORDING_RESUME;
             break;
         case VoiceLabPrompt::StartRequested:
             sound = Lang::Sounds::OGG_VL_START_REQUESTED;

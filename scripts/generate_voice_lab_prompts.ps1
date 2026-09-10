@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$Ffmpeg,
-    [string]$Voice = 'Microsoft Huihui Desktop'
+    [string]$Voice = 'Microsoft Huihui Desktop',
+    [string[]]$Only = @()
 )
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Speech
@@ -11,6 +12,8 @@ $prompts = [ordered]@{
     vl_connected = '已连接网络。'
     vl_recording_start = '开始会议录音。'
     vl_recording_stop = '录音已停止。'
+    vl_recording_pause = '录音已暂停。'
+    vl_recording_resume = '继续会议录音。'
     vl_start_requested = '已请求开始录音，请稍候。'
     vl_start_failed = '暂时无法开始录音，请在网页查看设备状态。'
     vl_interrupted = '录音已停止，请在网页检查本次结果。'
@@ -21,6 +24,7 @@ try {
     $synth.SelectVoice($Voice)
     $synth.Rate = 0
     foreach ($entry in $prompts.GetEnumerator()) {
+        if ($Only.Count -gt 0 -and $entry.Key -notin $Only) { continue }
         $synth.SetOutputToWaveFile($temporary)
         $synth.Speak($entry.Value)
         $synth.SetOutputToNull()

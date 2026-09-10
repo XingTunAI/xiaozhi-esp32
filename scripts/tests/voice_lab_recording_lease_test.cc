@@ -71,6 +71,8 @@ constexpr int run_recording_lease_test(int scenario) {
         case 6: {  // Bounds reject invalid network values, shorter grants take effect.
             CHECK(!lease.Begin(0, 0, 999, 60000));
             CHECK(!lease.Begin(0, 0, 30001, 60000));
+            CHECK(!lease.Begin(0, 0, 30000, -1));
+            CHECK(!lease.Begin(0, 0, 30000, 1));
             CHECK(!lease.Begin(0, 0, 30000, 59999));
             CHECK(!lease.Begin(0, 0, 30000, 3600001));
             CHECK(lease.Begin(0, 0, 30000, 60000));
@@ -81,6 +83,43 @@ constexpr int run_recording_lease_test(int scenario) {
             CHECK(lease.RequestRenewal(11666666) > 0);
             break;
         }
+        case 7:  // Administrator grants can renew beyond the former one-hour maximum.
+            CHECK(lease.Begin(1000000, 1000000, 30000, 0));
+            CHECK(lease.MaximumDeadline() == 0);
+            for (int64_t time = 11000000; time <= 3701000000LL; time += 10000000) {
+                const auto id = lease.RequestRenewal(time);
+                CHECK(id > 0);
+                CHECK(lease.Renew(time, id, 30000));
+                CHECK(lease.Deadline() == time + 30000000);
+                CHECK(lease.MaximumDeadline() == 0);
+            }
+            CHECK(!lease.Expired(3701000000LL));
+            break;
+        case 8: {  // No total limit still requires a live, timely renewable lease.
+            CHECK(lease.Begin(0, 0, 30000, 0));
+            const auto id = lease.RequestRenewal(10000000);
+            CHECK(id > 0);
+            CHECK(!lease.Expired(29999999));
+            CHECK(lease.Expired(30000000));
+            CHECK(!lease.Renew(30000000, id, 30000));
+            CHECK(lease.RequestRenewal(30000000) == 0);
+            break;
+        }
+        case 9:  // A later customer grant reinstates its positive absolute maximum.
+            CHECK(!VoiceLabRecordingLease::DeadlineExpired(0, 3701000000LL));
+            CHECK(VoiceLabRecordingLease::DeadlineExpired(60000000, 60000000));
+            CHECK(lease.Begin(0, 0, 30000, 0));
+            lease.Clear();
+            CHECK(lease.Begin(1000000, 1000000, 30000, 60000));
+            CHECK(lease.MaximumDeadline() == 61000000);
+            for (int64_t time = 11000000; time <= 51000000; time += 10000000) {
+                const auto id = lease.RequestRenewal(time);
+                CHECK(id > 0);
+                CHECK(lease.Renew(time, id, 30000));
+            }
+            CHECK(lease.Deadline() == 61000000);
+            CHECK(lease.Expired(61000000));
+            break;
         default:
             return -1;
     }

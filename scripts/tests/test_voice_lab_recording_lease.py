@@ -43,3 +43,12 @@ class RecordingLeaseTests(unittest.TestCase):
 
     def test_duration_bounds_and_shorter_lease(self):
         self.check_lease(6)
+
+    def test_unlimited_total_duration_renews_beyond_one_hour(self):
+        self.check_lease(7)
+
+    def test_unlimited_total_duration_still_expires_without_renewal(self):
+        self.check_lease(8)
+
+    def test_customer_maximum_returns_after_unlimited_session(self):
+        self.check_lease(9)

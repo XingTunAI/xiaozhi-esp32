@@ -73,7 +73,7 @@ public:
 private:
     static constexpr uint32_t kKeyMask =
         IO_EXPANDER_PIN_NUM_9 | IO_EXPANDER_PIN_NUM_10 | IO_EXPANDER_PIN_NUM_11;
-    static constexpr int64_t kLongPressUs = 3000000;
+    static constexpr int64_t kLongPressUs = 2000000;
     static constexpr int64_t kMaximumSampleGapUs = 100000;
     static constexpr unsigned kDebounceSamples = 3;
 
