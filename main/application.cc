@@ -1452,6 +1452,11 @@ bool Application::PrepareVoiceLabCapture(uint32_t timeout_ms) {
         } else {
             notify_player_.Stop();
         }
+        // StopNotification restores low power. Override it after playback cleanup
+        // before the standalone capture worker opens its TLS audio connection.
+#if CONFIG_VOICE_LAB_STANDALONE_MODE
+        Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+#endif
         stop_completed->store(true, std::memory_order_release);
     });
 

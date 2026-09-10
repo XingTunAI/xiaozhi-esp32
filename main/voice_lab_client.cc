@@ -653,6 +653,12 @@ void VoiceLabClient::SetUserState(UserState state) {
 #if CONFIG_VOICE_LAB_STANDALONE_MODE
         if (Application::GetInstance().GetDeviceState() == kDeviceStateWifiConfiguring)
             return;
+        // Standalone capture does not open the Xiaozhi protocol's audio channel,
+        // so it must own the Wi-Fi performance lifecycle itself. Keep the link
+        // awake through pause and final audio confirmation as well.
+        const auto current_state = user_state_.load();
+        const bool idle = current_state == UserState::Ready || current_state == UserState::Error;
+        board.SetPowerSaveLevel(idle ? PowerSaveLevel::LOW_POWER : PowerSaveLevel::PERFORMANCE);
         auto* display = board.GetDisplay();
         if (!display)
             return;
@@ -1814,7 +1820,14 @@ bool VoiceLabClient::FlushPendingAudioLocked(bool force) {
         ESP_LOGI(TAG, "Voice Lab PCM first batch ready: frames=%u packet_bytes=%u",
                  static_cast<unsigned>(frames_to_send), static_cast<unsigned>(packet.size()));
     }
+    const auto send_started_us = esp_timer_get_time();
     bool sent = audio_websocket_->Send(packet.data(), packet.size(), true);
+    const auto send_elapsed_us = esp_timer_get_time() - send_started_us;
+    if (send_elapsed_us >= 500000) {
+        ESP_LOGW(TAG, "Voice Lab PCM socket send delayed: elapsed_ms=%lld bytes=%u",
+                 static_cast<long long>(send_elapsed_us / 1000),
+                 static_cast<unsigned>(packet.size()));
+    }
     if (!sent) {
         ESP_LOGW(TAG, "Failed to send Voice Lab PCM batch: frames=%u samples=%u",
                  static_cast<unsigned>(frames_to_send), static_cast<unsigned>(samples_to_send));
