@@ -192,21 +192,11 @@ public:
                 return;
             }
             Application::GetInstance().Schedule([this]() {
-                auto state = Application::GetInstance().GetDeviceState();
-                if (state == kDeviceStateStarting) {
-                    RequestWifiConfig();
-                } else if (VoiceLabClient::GetInstance().IsRecording()) {
-                    if (!action_pending_) {
-                        ShowHint("正在停止录音，请稍候");
-                        RunWorker(Action::Stop);
-                    }
-                } else if (WifiManager::GetInstance().IsConfigMode()) {
+                if (WifiManager::GetInstance().IsConfigMode()) {
                     ShowHint("请用手机连接设备热点完成配网");
                     QueueVoiceLabPrompt(VoiceLabPrompt::WifiSetup);
-                } else if (state == kDeviceStateWifiConfiguring) {
-                    ShowHint("配网已关闭，长按 BOOT 3 秒可重新开启");
                 } else {
-                    ShowHint("请在 Voice Lab 网页开始录音");
+                    ShowHint("长按 BOOT 3 秒配网；K2 控制录音");
                 }
             });
         });
