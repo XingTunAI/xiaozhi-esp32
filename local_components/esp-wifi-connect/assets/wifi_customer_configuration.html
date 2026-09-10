@@ -106,7 +106,7 @@
       <p class="hint">保存 Wi-Fi 不代表平台已在线。如果仍显示离线，请稍候刷新，并按手册检查网络。</p>
     </section>
     <footer>
-      <p>每次配网窗口为 <strong>10 分钟</strong>，从热点开启时计时。超时后，请<strong>长按 BOOT 键 3 秒</strong>重新开启配网，再连接音箱热点。</p>
+      <p>热点开启 <strong>5 分钟</strong>后，设备会尝试已保存的 Wi-Fi。没有旧网络时会继续等待配网；旧网络连接失败时会重新开放热点。正在提交或验证新 Wi-Fi 时不会中断。</p>
     </footer>
   </main>
   <script>
@@ -201,7 +201,7 @@
           byId('exit-retry').hidden = true;
         }).catch(function () {
           show('exit-status', '');
-          show('exit-error', 'Wi-Fi 已保存，但未能确认关闭热点请求。若手机仍连接音箱热点，可点击重试；也可等待本次 10 分钟配网窗口结束，热点会自动关闭。');
+          show('exit-error', 'Wi-Fi 已保存，但未能确认关闭热点请求。若手机仍连接音箱热点，可点击重试；设备稍后也会尝试连接已保存的 Wi-Fi。');
           byId('exit-retry').hidden = false;
         }).then(function () {
           closing = false;

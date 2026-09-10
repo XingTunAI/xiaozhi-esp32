@@ -56,6 +56,11 @@ public:
      * This is called when user requests to exit config mode (e.g., via /exit endpoint)
      */
     void OnExitRequested(std::function<void()> callback);
+    bool TryBeginTimeout() {
+        uint8_t idle = 0;
+        return request_state_.compare_exchange_strong(idle, 2);
+    }
+    void CancelTimeout() { request_state_.store(0); }
 
 private:
     std::mutex mutex_;
@@ -81,6 +86,8 @@ private:
     bool customer_mode_ = false;
     std::string ap_password_;
     std::atomic<bool> exit_pending_{false};
+    // 0 = idle, 1 = submitting/testing WiFi, 2 = timeout owns shutdown.
+    std::atomic<uint8_t> request_state_{0};
     std::atomic<uint32_t> config_generation_{0};
 
     // Callbacks

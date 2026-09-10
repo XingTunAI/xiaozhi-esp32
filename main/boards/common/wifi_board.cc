@@ -60,7 +60,7 @@ void WifiBoard::StartNetwork() {
     config.show_ota_config = false;
     config.show_sleep_config = false;
     config.customer_mode = true;
-    config.config_ap_timeout_seconds = 10 * 60;
+    config.config_ap_timeout_seconds = 5 * 60;
 #else
     config.ssid_prefix = "Xiaozhi";
     config.show_ota_config = true;
@@ -105,23 +105,22 @@ void WifiBoard::StartNetwork() {
                 break;
             case WifiEvent::ConfigModeExpired:
 #if CONFIG_VOICE_LAB_STANDALONE_MODE && CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_AUDIO_BOARD
-                config_window_expired_ = true;
+                config_window_expired_ = false;
                 in_config_mode_ = false;
                 Application::GetInstance().Schedule([this]() {
                     if (auto display = GetDisplay()) {
-                        display->SetStatus("配网已关闭");
+                        display->SetStatus("正在尝试已保存的 Wi-Fi");
                         display->SetChatMessage("system",
-                                                "配网已超时。长按 BOOT 3 秒可重新开启配网。");
+                                                "正在连接旧网络；连接失败会重新开放配网热点。");
                     }
                     if (network_event_callback_) {
                         network_event_callback_(NetworkEvent::WifiConfigModeExit, "");
                     }
                 });
-                // Keep retrying saved networks, but never turn timeout into a
-                // loop of fresh AP windows. A physical long press opens a new one.
-                if (!SsidManager::GetInstance().GetSsidList().empty()) {
-                    WifiManager::GetInstance().StartStation();
-                }
+                // The manager retains AP when no saved network exists. Bound
+                // fallback attempts too, so an unavailable old network cannot
+                // strand the customer without a portal.
+                TryWifiConnect();
 #else
                 OnNetworkEvent(NetworkEvent::WifiConfigModeExit);
 #endif
@@ -242,7 +241,7 @@ void WifiBoard::StartWifiConfigMode() {
 
 #if CONFIG_VOICE_LAB_STANDALONE_MODE && CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_AUDIO_BOARD
         // Alert logs its message, so keep the device-specific password out of it.
-        Application::GetInstance().Alert("手机配网（10 分钟）", hint.c_str(), "gear");
+        Application::GetInstance().Alert("手机配网", hint.c_str(), "gear");
         QueueVoiceLabPrompt(VoiceLabPrompt::WifiSetup);
 #else
         Application::GetInstance().Alert(Lang::Strings::WIFI_CONFIG_MODE, hint.c_str(), "gear",

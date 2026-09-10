@@ -467,6 +467,17 @@ void WifiConfigurationAp::StartWebServer() {
         .uri = "/submit",
         .method = HTTP_POST,
         .handler = [](httpd_req_t* req) -> esp_err_t {
+            auto* this_ = static_cast<WifiConfigurationAp*>(req->user_ctx);
+            uint8_t idle = 0;
+            if (!this_->request_state_.compare_exchange_strong(idle, 1)) {
+                httpd_resp_set_status(req, "503 Service Unavailable");
+                httpd_resp_send(req, "WiFi setup is busy; retry shortly", HTTPD_RESP_USE_STRLEN);
+                return ESP_OK;
+            }
+            struct CompleteRequest {
+                std::atomic<uint8_t>& state;
+                ~CompleteRequest() { state.store(0); }
+            } complete_request{this_->request_state_};
             char* buf;
             size_t buf_len = req->content_len;
             if (buf_len > 1024) {  // 限制最大请求体大小
@@ -507,7 +518,6 @@ void WifiConfigurationAp::StartWebServer() {
                 return ESP_FAIL;
             }
 
-            auto* this_ = static_cast<WifiConfigurationAp*>(req->user_ctx);
             // Enforce the customer boundary on the server. A handcrafted POST
             // must never reach Voice Lab enrollment/server writes or token erasure.
             if (this_->customer_mode_) {

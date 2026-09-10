@@ -47,7 +47,7 @@ enum class WifiEvent {
     Disconnected,       // Disconnected from network
     ConfigModeEnter,    // Entered config AP mode
     ConfigModeExit,     // Exited config AP mode
-    ConfigModeExpired,  // Configuration window elapsed; do not reopen automatically
+    ConfigModeExpired,  // Configuration window elapsed; board may retry saved WiFi
 };
 
 // Configuration

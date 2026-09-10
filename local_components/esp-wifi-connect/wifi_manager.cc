@@ -3,6 +3,7 @@
  */
 
 #include "wifi_manager.h"
+#include "ssid_manager.h"
 #include "wifi_configuration_ap.h"
 #include "wifi_station.h"
 
@@ -497,6 +498,7 @@ void WifiManager::StartConfigAp() {
         StopConfigAp();
     });
 
+    config_ap_->CancelTimeout();
     config_ap_->Start();
     config_mode_active_ = true;
     if (config_window_timer_) {
@@ -522,6 +524,19 @@ void WifiManager::StopConfigApInternal(bool expired) {
     // A queued timer worker must not close a newly opened configuration window.
     if (expired && esp_timer_get_time() < config_window_deadline_us_) {
         return;
+    }
+    if (expired && config_.customer_mode) {
+        if (!config_ap_->TryBeginTimeout()) {
+            // A timeout cannot interrupt an HTTP submission or WiFi validation.
+            config_window_deadline_us_ = esp_timer_get_time() + 30000000LL;
+            esp_timer_start_once(config_window_timer_, 30000000ULL);
+            return;
+        }
+        if (SsidManager::GetInstance().GetSsidList().empty()) {
+            config_ap_->CancelTimeout();
+            ESP_LOGI(TAG, "No saved WiFi; retaining configuration AP");
+            return;
+        }
     }
     if (config_window_timer_) {
         esp_timer_stop(config_window_timer_);
