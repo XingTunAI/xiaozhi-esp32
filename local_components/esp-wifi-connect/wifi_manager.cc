@@ -232,7 +232,10 @@ bool WifiManager::Initialize(const WifiManagerConfig& config) {
     station_ = std::make_unique<WifiStation>();
     config_ap_ = std::make_unique<WifiConfigurationAp>();
 
-    if (config_.customer_mode && !LoadOrCreateApPassword()) {
+    // Open provisioning deliberately ignores any legacy NVS AP password.
+    // Preserve that key for firmware rollback; do not touch station or device credentials.
+    ap_password_.clear();
+    if (config_.customer_mode && !config_.open_config_ap && !LoadOrCreateApPassword()) {
         ESP_LOGE(TAG, "Customer AP credential unavailable; refusing open provisioning");
         return false;
     }

@@ -73,6 +73,8 @@ struct WifiManagerConfig {
     bool show_sleep_config = false;
     // Customer mode serves only WiFi setup and cannot modify service/identity settings.
     bool customer_mode = false;
+    // Explicit board opt-in; existing customer boards retain their protected AP.
+    bool open_config_ap = false;
     // Zero retains the legacy unlimited window. Customer boards choose a bound.
     uint32_t config_ap_timeout_seconds = 0;
 };

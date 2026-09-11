@@ -46,6 +46,10 @@ bool SpeakVoiceLabPrompt(VoiceLabPrompt prompt) {
                 return false;
             // Physical playback only. Never use Alert, status JSON or logs.
             const auto password = wifi.GetApPassword();
+            if (password.empty()) {
+                audio.PlaySound(Lang::Sounds::OGG_VL_WIFI_OPEN);
+                return DrainPrompt(audio);
+            }
             if (password.size() != 8)
                 return false;
             audio.PlaySound(Lang::Sounds::OGG_VL_WIFI_SETUP);

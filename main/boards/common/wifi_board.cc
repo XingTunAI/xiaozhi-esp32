@@ -60,6 +60,7 @@ void WifiBoard::StartNetwork() {
     config.show_ota_config = false;
     config.show_sleep_config = false;
     config.customer_mode = true;
+    config.open_config_ap = true;
     config.config_ap_timeout_seconds = 5 * 60;
 #else
     config.ssid_prefix = "Xiaozhi";
@@ -240,7 +241,7 @@ void WifiBoard::StartWifiConfigMode() {
         hint += wifi_manager.GetApWebUrl();
 
 #if CONFIG_VOICE_LAB_STANDALONE_MODE && CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_AUDIO_BOARD
-        // Alert logs its message, so keep the device-specific password out of it.
+        // This board uses an open AP; keep the spoken setup instruction short.
         Application::GetInstance().Alert("手机配网", hint.c_str(), "gear");
         QueueVoiceLabPrompt(VoiceLabPrompt::WifiSetup);
 #else
