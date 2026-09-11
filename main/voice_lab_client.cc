@@ -473,11 +473,14 @@ bool VoiceLabClient::Connect() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (generation != connection_generation_.load() || manual_disconnect_.load())
         return false;
-    if (control_websocket_ != nullptr && control_websocket_->IsConnected()) {
-        connected_.store(true);
+    if (connected_.load() && control_websocket_ != nullptr && control_websocket_->IsConnected() &&
+        esp_timer_get_time() - last_control_rx_us_.load() < kControlSilenceLimitUs) {
         return true;
     }
     if (control_websocket_ != nullptr) {
+        // A socket may still report connected after its peer becomes unreachable.
+        // Dispose of it locally; sending a close frame can block on the dead link.
+        connected_.store(false);
         control_websocket_.reset();
     }
 
@@ -546,8 +549,8 @@ bool VoiceLabClient::ConnectControlLocked(const std::string& url, const std::str
         return false;
     }
 
-    connected_.store(true);
     last_control_rx_us_.store(esp_timer_get_time());
+    connected_.store(true);
     if (boot_id_ == 0) {
         // Keep stream sequence numbers monotonic for the entire boot. The
         // server deduplicates on (deviceKey, bootId), including separate tests.
@@ -803,6 +806,17 @@ bool VoiceLabClient::EnsureControlTask() {
                 if (client->GetUserState() == UserState::Requesting)
                     client->SetUserState(UserState::Error);
                 QueueVoiceLabPrompt(VoiceLabPrompt::StartFailed);
+            }
+            // Check liveness even in standby and independently of a blocked
+            // heartbeat writer. The heartbeat task schedules the reconnect;
+            // this timer must never join a socket or acquire its send mutex.
+            if (client->connected_.load() &&
+                now - client->last_control_rx_us_.load() >= kControlSilenceLimitUs &&
+                client->connected_.exchange(false)) {
+                ESP_LOGW(TAG, "Control heartbeat expired: rx_age_ms=%lld; reconnect required",
+                         static_cast<long long>((now - client->last_control_rx_us_.load()) / 1000));
+                client->control_epoch_.fetch_add(1);
+                client->AbortRecording();
             }
             if (!client->recording_.load())
                 return;

@@ -74,6 +74,13 @@ bool EspSsl::Connect(const std::string& host, int port) {
     } else {
         ESP_LOGI(TAG, "TCP_NODELAY enabled for realtime transport");
     }
+    // Bound each blocking socket write so a lost peer cannot indefinitely hold
+    // the application/heartbeat sender. The complete TLS send has its own budget.
+    const timeval send_timeout = {.tv_sec = 5, .tv_usec = 0};
+    if (sockfd >= 0 &&
+        setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout)) != 0) {
+        ESP_LOGW(TAG, "Unable to set socket send timeout: errno=%d", errno);
+    }
 #endif
     connected_ = true;
 
@@ -137,6 +144,15 @@ void EspSsl::Disconnect() {
     }
 }
 
+void EspSsl::FailSend(int error) {
+    last_error_ = error;
+    connected_ = false;
+    int sockfd = -1;
+    if (tls_client_ && esp_tls_get_conn_sockfd(tls_client_, &sockfd) == ESP_OK && sockfd >= 0) {
+        shutdown(sockfd, SHUT_RDWR);
+    }
+}
+
 /* CONFIG_MBEDTLS_SSL_RENEGOTIATION should be disabled in sdkconfig.
  * Otherwise, invalid memory access may be triggered.
  */
@@ -149,8 +165,7 @@ int EspSsl::Send(const std::string& data) {
     const auto lock_wait_us = esp_timer_get_time() - lock_started_us;
     if (lock_wait_us >= 500000) {
         ESP_LOGW(TAG, "TLS sender lock delayed: wait_ms=%lld bytes=%u",
-                 static_cast<long long>(lock_wait_us / 1000),
-                 static_cast<unsigned>(data.size()));
+                 static_cast<long long>(lock_wait_us / 1000), static_cast<unsigned>(data.size()));
     }
 #endif
     if (!connected_ || tls_client_ == nullptr) {
@@ -161,11 +176,20 @@ int EspSsl::Send(const std::string& data) {
     size_t total_sent = 0;
     size_t data_size = data.size();
     const char* data_ptr = data.data();
+#if CONFIG_VOICE_LAB_STANDALONE_MODE
+    const auto send_deadline_us = esp_timer_get_time() + 10000000;
+#endif
 
     while (total_sent < data_size) {
         if (!connected_)
             return -1;
 #if CONFIG_VOICE_LAB_STANDALONE_MODE
+        if (esp_timer_get_time() >= send_deadline_us) {
+            ESP_LOGW(TAG, "TLS send deadline expired: sent=%u bytes=%u",
+                     static_cast<unsigned>(total_sent), static_cast<unsigned>(data_size));
+            FailSend(ESP_ERR_TIMEOUT);
+            return -1;
+        }
         const auto write_started_us = esp_timer_get_time();
 #endif
         int ret = esp_tls_conn_write(tls_client_, data_ptr + total_sent, data_size - total_sent);
@@ -174,17 +198,19 @@ int EspSsl::Send(const std::string& data) {
         if (write_elapsed_us >= 500000) {
             ESP_LOGW(TAG, "TLS write delayed: write_ms=%lld bytes=%u result=%d errno=%d",
                      static_cast<long long>(write_elapsed_us / 1000),
-                     static_cast<unsigned>(data_size - total_sent), ret, errno);
+                     static_cast<unsigned>(data_size - total_sent), ret, ret < 0 ? errno : 0);
         }
 #endif
 
-        if (ret == ESP_TLS_ERR_SSL_WANT_WRITE) {
+        if (ret == ESP_TLS_ERR_SSL_WANT_WRITE || ret == ESP_TLS_ERR_SSL_WANT_READ) {
+            vTaskDelay(1);
             continue;
         }
 
         if (ret <= 0) {
             ESP_LOGE(TAG, "SSL send failed: ret=%d, errno=%d", ret, errno);
-            return ret;
+            FailSend(ret < 0 ? ret : ESP_FAIL);
+            return -1;
         }
 
         total_sent += ret;

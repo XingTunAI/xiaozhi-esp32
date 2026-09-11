@@ -30,6 +30,8 @@ private:
 
     void ReceiveTask();
     bool InReceiveTask() const;
+    // Caller owns send_mutex_. Wake the receiver to deliver disconnection there.
+    void FailSend(int error);
 };
 
 #endif  // _ESP_SSL_H_

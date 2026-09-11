@@ -277,7 +277,7 @@ bool WebSocket::Send(const void* data, size_t len, bool binary, bool fin) {
                  static_cast<unsigned>(frame.size()), binary, result);
     }
 #endif
-    return result >= 0;
+    return result == static_cast<int>(frame.size());
 }
 
 void WebSocket::Ping() {
@@ -474,5 +474,5 @@ bool WebSocket::SendControlFrame(uint8_t opcode, const void* data, size_t len) {
 
     // 发送帧
     std::lock_guard<std::mutex> lock(send_mutex_);
-    return tcp_->Send(frame) >= 0;
+    return tcp_->Send(frame) == static_cast<int>(frame.size());
 }
