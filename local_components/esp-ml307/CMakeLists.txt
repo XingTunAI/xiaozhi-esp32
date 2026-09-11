@@ -40,6 +40,7 @@ idf_component_register(
         "esp_driver_uart"
         "esp_pm"
         "esp-tls"
+        "esp_timer"
         "pthread"
         "mqtt"
 )

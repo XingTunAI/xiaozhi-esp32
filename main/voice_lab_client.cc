@@ -1629,9 +1629,18 @@ bool VoiceLabClient::FlushPendingAudioLocked() {
     bool sent = audio_websocket_->Send(packet.data(), packet.size(), true);
     const auto send_elapsed_us = esp_timer_get_time() - send_started_us;
     if (send_elapsed_us >= 500000) {
-        ESP_LOGW(TAG, "Voice Lab PCM socket send delayed: elapsed_ms=%lld bytes=%u",
+        size_t queued_after_send;
+        {
+            std::lock_guard<std::mutex> lock(pcm_mutex_);
+            queued_after_send = pending_audio_pcm_.size() / kPcmSamplesPerFrame;
+        }
+        ESP_LOGW(TAG,
+                 "Voice Lab PCM socket send delayed: elapsed_ms=%lld bytes=%u "
+                 "pending_before=%u pending_after=%u unacked_samples=%llu",
                  static_cast<long long>(send_elapsed_us / 1000),
-                 static_cast<unsigned>(packet.size()));
+                 static_cast<unsigned>(packet.size()), static_cast<unsigned>(remaining_frames),
+                 static_cast<unsigned>(queued_after_send),
+                 static_cast<unsigned long long>(sample_start_ - acknowledged_sample_end_.load()));
     }
     if (!sent) {
         ESP_LOGW(TAG, "Failed to send Voice Lab PCM batch: frames=%u samples=%u",

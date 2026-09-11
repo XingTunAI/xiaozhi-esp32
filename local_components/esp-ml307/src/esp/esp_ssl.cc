@@ -1,6 +1,7 @@
 #include "esp_ssl.h"
 #include <esp_crt_bundle.h>
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <mbedtls/ssl_ciphersuites.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
@@ -140,7 +141,18 @@ void EspSsl::Disconnect() {
  * Otherwise, invalid memory access may be triggered.
  */
 int EspSsl::Send(const std::string& data) {
+#if CONFIG_VOICE_LAB_STANDALONE_MODE
+    const auto lock_started_us = esp_timer_get_time();
+#endif
     std::lock_guard<std::mutex> sender(send_mutex_);
+#if CONFIG_VOICE_LAB_STANDALONE_MODE
+    const auto lock_wait_us = esp_timer_get_time() - lock_started_us;
+    if (lock_wait_us >= 500000) {
+        ESP_LOGW(TAG, "TLS sender lock delayed: wait_ms=%lld bytes=%u",
+                 static_cast<long long>(lock_wait_us / 1000),
+                 static_cast<unsigned>(data.size()));
+    }
+#endif
     if (!connected_ || tls_client_ == nullptr) {
         ESP_LOGE(TAG, "Not connected");
         return -1;
@@ -153,7 +165,18 @@ int EspSsl::Send(const std::string& data) {
     while (total_sent < data_size) {
         if (!connected_)
             return -1;
+#if CONFIG_VOICE_LAB_STANDALONE_MODE
+        const auto write_started_us = esp_timer_get_time();
+#endif
         int ret = esp_tls_conn_write(tls_client_, data_ptr + total_sent, data_size - total_sent);
+#if CONFIG_VOICE_LAB_STANDALONE_MODE
+        const auto write_elapsed_us = esp_timer_get_time() - write_started_us;
+        if (write_elapsed_us >= 500000) {
+            ESP_LOGW(TAG, "TLS write delayed: write_ms=%lld bytes=%u result=%d errno=%d",
+                     static_cast<long long>(write_elapsed_us / 1000),
+                     static_cast<unsigned>(data_size - total_sent), ret, errno);
+        }
+#endif
 
         if (ret == ESP_TLS_ERR_SSL_WANT_WRITE) {
             continue;
@@ -194,7 +217,17 @@ void EspSsl::ReceiveTask() {
 
         if (stream_callback_) {
             data.resize(ret);
+#if CONFIG_VOICE_LAB_STANDALONE_MODE
+            const auto callback_started_us = esp_timer_get_time();
+#endif
             stream_callback_(data);
+#if CONFIG_VOICE_LAB_STANDALONE_MODE
+            const auto callback_elapsed_us = esp_timer_get_time() - callback_started_us;
+            if (callback_elapsed_us >= 500000) {
+                ESP_LOGW(TAG, "TLS receive callback delayed: callback_ms=%lld bytes=%d",
+                         static_cast<long long>(callback_elapsed_us / 1000), ret);
+            }
+#endif
         }
     }
 }

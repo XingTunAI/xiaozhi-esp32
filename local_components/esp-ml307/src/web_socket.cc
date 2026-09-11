@@ -1,6 +1,7 @@
 #include "web_socket.h"
 #include "network_interface.h"
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <cstdlib>
 #include <cstring>
 #include <esp_pthread.h>
@@ -209,6 +210,9 @@ bool WebSocket::Send(const std::string& data) {
 }
 
 bool WebSocket::Send(const void* data, size_t len, bool binary, bool fin) {
+#if CONFIG_VOICE_LAB_STANDALONE_MODE
+    const auto started_us = esp_timer_get_time();
+#endif
     if (len > 65535) {
         ESP_LOGE(TAG, "Data too large, maximum supported size is 65535 bytes");
         return false;
@@ -253,8 +257,27 @@ bool WebSocket::Send(const void* data, size_t len, bool binary, bool fin) {
     continuation_ = !fin;
 
     // 发送帧
+#if CONFIG_VOICE_LAB_STANDALONE_MODE
+    const auto built_us = esp_timer_get_time();
+#endif
     std::lock_guard<std::mutex> lock(send_mutex_);
-    return tcp_->Send(frame) >= 0;
+#if CONFIG_VOICE_LAB_STANDALONE_MODE
+    const auto locked_us = esp_timer_get_time();
+#endif
+    const auto result = tcp_->Send(frame);
+#if CONFIG_VOICE_LAB_STANDALONE_MODE
+    const auto finished_us = esp_timer_get_time();
+    if (finished_us - started_us >= 500000) {
+        ESP_LOGW(TAG,
+                 "WebSocket send delayed: build_ms=%lld lock_ms=%lld transport_ms=%lld "
+                 "bytes=%u binary=%d result=%d",
+                 static_cast<long long>((built_us - started_us) / 1000),
+                 static_cast<long long>((locked_us - built_us) / 1000),
+                 static_cast<long long>((finished_us - locked_us) / 1000),
+                 static_cast<unsigned>(frame.size()), binary, result);
+    }
+#endif
+    return result >= 0;
 }
 
 void WebSocket::Ping() {
