@@ -16,6 +16,7 @@
 #include <esp_rom_sys.h>
 #include <esp_sntp.h>
 #include <esp_system.h>
+#include <esp_random.h>
 #include <esp_timer.h>
 #include <cJSON.h>
 #include <freertos/FreeRTOS.h>
@@ -332,13 +333,17 @@ void VoiceLabClient::ResetVoiceLabSettings() {
 bool VoiceLabClient::EnrollIfNeeded() {
     auto existing_token = GetDeviceToken();
     if (!existing_token.empty()) {
-        return true;
+        return ConfirmPendingBinding();
     }
 
     auto enrollment_code = NormalizeEnrollmentCode(GetEnrollmentCode());
     if (enrollment_code.empty()) {
-        ESP_LOGW(TAG, "Voice Lab device is not paired; generate an enrollment code in the console");
-        return false;
+        bool expected = false;
+        if (!binding_active_.compare_exchange_strong(expected, true))
+            return false;
+        const bool result = RunCustomerBinding("");
+        binding_active_.store(false);
+        return result;
     }
     if (!EnsureSystemTimeForTls(IsTlsEnabled())) {
         return false;
@@ -412,6 +417,192 @@ bool VoiceLabClient::EnrollIfNeeded() {
     }
     ESP_LOGI(TAG, "Voice Lab device paired successfully; credential stored in NVS");
     return true;
+}
+
+cJSON* VoiceLabClient::BindingHttp(const char* action, const std::string& proof,
+                                   const std::string& existing_token, int& status) {
+    status = 0;
+    if (!IsTlsEnabled() || !WifiManager::GetInstance().IsConnected())
+        return nullptr;
+    cJSON* body = cJSON_CreateObject();
+    cJSON_AddStringToObject(body, "deviceKey", GetDeviceKey().c_str());
+    cJSON_AddStringToObject(body, "proof", proof.c_str());
+    if (strcmp(action, "start") == 0)
+        cJSON_AddStringToObject(body, "hardwareProfile", GetHardwareProfile().c_str());
+    auto http = Board::GetInstance().GetNetwork()->CreateHttp(2);
+    http->SetTimeout(kEnrollmentHttpTimeoutMs);
+    http->SetHeader("Content-Type", "application/json");
+    http->SetHeader("Cache-Control", "no-store");
+    if (!existing_token.empty())
+        http->SetHeader("X-Device-Token", existing_token);
+    http->SetContent(PrintJson(body));
+    cJSON_Delete(body);
+    if (!http->Open("POST", BuildHttpUrl(std::string("/api/v1/device-claims/") + action)))
+        return nullptr;
+    status = http->GetStatusCode();
+    auto response = http->ReadAll();
+    http->Close();
+    // No response body, code, proof or credential is written to logs/status.
+    if (response.size() > 4096)
+        return nullptr;
+    return cJSON_Parse(response.c_str());
+}
+
+bool VoiceLabClient::ConfirmPendingBinding() {
+    Settings settings("voice_lab", false);
+    if (!settings.GetBool("claim_pending", false))
+        return true;
+    const auto token = GetDeviceToken();
+    if (token.size() != 68 || token.compare(0, 4, "vld_") != 0)
+        return false;
+    int status = 0;
+    auto* reply = BindingHttp("confirm", token.substr(4), "", status);
+    auto* state = cJSON_GetObjectItem(reply, "state");
+    const bool ok =
+        status == 200 && cJSON_IsString(state) && strcmp(state->valuestring, "confirmed") == 0;
+    cJSON_Delete(reply);
+    if (ok) {
+        Settings saved("voice_lab", true);
+        saved.EraseKey("claim_pending");
+        saved.EraseKey("enrollment_code");
+        customer_bound_.store(true);
+    }
+    return ok;
+}
+
+std::string VoiceLabClient::GetBindingCode() const {
+    std::lock_guard<std::mutex> lock(binding_mutex_);
+    return esp_timer_get_time() < binding_code_deadline_us_ ? binding_code_ : "";
+}
+
+void VoiceLabClient::BeginCustomerBinding() {
+    std::unique_lock<std::mutex> operation(recording_mutex_, std::try_to_lock);
+    if (!operation.owns_lock())
+        return;
+    if (IsRecording() || customer_bound_.load() || GetUserState() == UserState::Requesting ||
+        GetUserState() == UserState::Starting || GetUserState() == UserState::Stopping ||
+        !WifiManager::GetInstance().IsConnected())
+        return;
+    if (!GetBindingCode().empty()) {
+        QueueVoiceLabPrompt(VoiceLabPrompt::BindingCode);
+        return;
+    }
+    bool expected = false;
+    if (!binding_active_.compare_exchange_strong(expected, true))
+        return;
+    if (xTaskCreate(
+            [](void* arg) {
+                auto* client = static_cast<VoiceLabClient*>(arg);
+                const bool ok = client->RunCustomerBinding(client->GetDeviceToken());
+                client->binding_active_.store(false);
+                if (ok && !client->IsConnected())
+                    client->ConnectAsync();
+                else
+                    client->SetUserState(client->IsConnected() ? UserState::Ready
+                                                               : UserState::Error);
+                vTaskDelete(nullptr);
+            },
+            "vl_binding", 8192, this, 2, nullptr) != pdPASS) {
+        binding_active_.store(false);
+    }
+}
+
+bool VoiceLabClient::RunCustomerBinding(const std::string& existing_token) {
+    if (!EnsureSystemTimeForTls(IsTlsEnabled()))
+        return false;
+    const auto generation = connection_generation_.load();
+    uint8_t random[32];
+    esp_fill_random(random, sizeof(random));
+    const char hex[] = "0123456789abcdef";
+    std::string proof;
+    proof.reserve(64);
+    for (auto value : random) {
+        proof.push_back(hex[value >> 4]);
+        proof.push_back(hex[value & 15]);
+    }
+    int status = 0;
+    auto* reply = BindingHttp("start", proof, existing_token, status);
+    auto* state = cJSON_GetObjectItem(reply, "state");
+    if (status == 200 && cJSON_IsString(state) &&
+        strcmp(state->valuestring, "already_bound") == 0) {
+        customer_bound_.store(true);
+        cJSON_Delete(reply);
+        return true;
+    }
+    auto* code = cJSON_GetObjectItem(reply, "code");
+    auto* expires = cJSON_GetObjectItem(reply, "expiresInSeconds");
+    if (status != 200 || !cJSON_IsString(code) || strlen(code->valuestring) != 8 ||
+        strspn(code->valuestring, "0123456789") != 8 || !cJSON_IsNumber(expires) ||
+        expires->valueint <= 0 || expires->valueint > 300) {
+        cJSON_Delete(reply);
+        ESP_LOGW(TAG, "Customer binding unavailable, HTTP status=%d", status);
+        return false;
+    }
+    const auto deadline = esp_timer_get_time() + int64_t(expires->valueint) * 1000000;
+    {
+        std::lock_guard<std::mutex> lock(binding_mutex_);
+        binding_code_ = code->valuestring;
+        binding_code_deadline_us_ = deadline;
+    }
+    cJSON_Delete(reply);
+    SetUserState(UserState::Connecting);
+    QueueVoiceLabPrompt(VoiceLabPrompt::BindingCode);
+    bool confirmed = false;
+    while (esp_timer_get_time() < deadline && generation == connection_generation_.load() &&
+           !manual_disconnect_.load() && WifiManager::GetInstance().IsConnected()) {
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        reply = BindingHttp("poll", proof, "", status);
+        state = cJSON_GetObjectItem(reply, "state");
+        const bool claimed = status == 200 && cJSON_IsString(state) &&
+                             (strcmp(state->valuestring, "claimed") == 0 ||
+                              strcmp(state->valuestring, "confirmed") == 0);
+        cJSON_Delete(reply);
+        if (!claimed) {
+            if (status == 403 || status == 409)
+                break;
+            continue;
+        }
+        if (generation != connection_generation_.load() || manual_disconnect_.load() ||
+            !WifiManager::GetInstance().IsConnected())
+            break;
+        // Customer authorization has succeeded. Persist the candidate and a
+        // receipt marker atomically before confirming credential delivery, so a
+        // power loss here can finish registration at the next boot.
+        if (existing_token.empty()) {
+            nvs_handle_t nvs = 0;
+            esp_err_t saved = nvs_open("voice_lab", NVS_READWRITE, &nvs);
+            if (saved == ESP_OK) {
+                saved = nvs_set_str(nvs, "device_token", ("vld_" + proof).c_str());
+                if (saved == ESP_OK)
+                    saved = nvs_set_u8(nvs, "claim_pending", 1);
+                if (saved == ESP_OK)
+                    saved = nvs_commit(nvs);
+                nvs_close(nvs);
+            }
+            if (saved != ESP_OK) {
+                ESP_LOGE(TAG, "Could not persist authorized registration receipt");
+                break;
+            }
+            confirmed = ConfirmPendingBinding();
+        } else {
+            reply = BindingHttp("confirm", proof, "", status);
+            state = cJSON_GetObjectItem(reply, "state");
+            confirmed = status == 200 && cJSON_IsString(state) &&
+                        strcmp(state->valuestring, "confirmed") == 0;
+            cJSON_Delete(reply);
+        }
+        if (confirmed) {
+            customer_bound_.store(true);
+            QueueVoiceLabPrompt(VoiceLabPrompt::BindingDone);
+            break;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(binding_mutex_);
+        binding_code_.clear();
+        binding_code_deadline_us_ = 0;
+    }
+    return confirmed;
 }
 
 bool VoiceLabClient::IsConnected() const { return connected_.load(); }
@@ -1073,7 +1264,7 @@ bool VoiceLabClient::StartRecording(const std::string& recording_id, const std::
 }
 
 bool VoiceLabClient::RequestStartRecording() {
-    if (!IsConnected() || recording_.load() || tail_pending_.load() ||
+    if (binding_active_.load() || !IsConnected() || recording_.load() || tail_pending_.load() ||
         GetUserState() == UserState::Starting) {
         QueueVoiceLabPrompt(VoiceLabPrompt::StartFailed);
         return false;
@@ -1258,7 +1449,7 @@ bool VoiceLabClient::StartAuthorizedRecording(const std::string& recording_id,
                                               uint32_t authorized_epoch, const cJSON* authorization,
                                               int64_t received_at_us, const cJSON* capture_plan) {
     std::lock_guard<std::mutex> operation(recording_mutex_);
-    if (authorized_epoch != control_epoch_.load() || !IsConnected() || recording_.load() ||
+    if (binding_active_.load() || authorized_epoch != control_epoch_.load() || !IsConnected() || recording_.load() ||
         tail_pending_.load())
         return false;
     if (!ApplyRecordingAuthorization(authorization, received_at_us))

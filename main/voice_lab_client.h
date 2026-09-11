@@ -42,6 +42,8 @@ public:
     bool IsRecording() const { return recording_.load(); }
 
     bool PairWithEnrollmentCode(const std::string& enrollment_code);
+    void BeginCustomerBinding();
+    std::string GetBindingCode() const;
     void ClearPairing();
     void ResetVoiceLabSettings();
     bool StartRecording(const std::string& recording_id = "",
@@ -73,6 +75,11 @@ private:
     ~VoiceLabClient();
 
     mutable std::mutex mutex_;
+    mutable std::mutex binding_mutex_;
+    std::atomic<bool> binding_active_{false};
+    std::atomic<bool> customer_bound_{false};
+    std::string binding_code_;
+    int64_t binding_code_deadline_us_ = 0;
     std::mutex recording_mutex_;
     std::mutex pcm_mutex_;
     // Short metadata operations only; never held across network/audio waits.
@@ -153,6 +160,10 @@ private:
     std::string BuildHttpUrl(const std::string& path) const;
     std::string BuildWebsocketUrl(const std::string& path) const;
     bool EnrollIfNeeded();
+    bool RunCustomerBinding(const std::string& existing_token);
+    bool ConfirmPendingBinding();
+    cJSON* BindingHttp(const char* action, const std::string& proof,
+                       const std::string& existing_token, int& status);
     bool ConnectControlLocked(const std::string& url, const std::string& token);
     bool ConnectAudioLocked(const std::string& url, const std::string& token);
     void CloseAudioLocked();

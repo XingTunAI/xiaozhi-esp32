@@ -193,7 +193,12 @@ public:
 
     // The expander scanner dispatches these methods on the application task.
     // Short presses do not change capture or play sound into a recording.
-    void OnPrimaryClick() { ShowHint("长按 K2 2 秒开始或结束录音"); }
+    void OnPrimaryClick() {
+        auto& client = VoiceLabClient::GetInstance();
+        if (!client.IsRecording())
+            client.BeginCustomerBinding();
+        ShowHint("未绑定时短按 K2 获取绑定码；长按 2 秒控制录音");
+    }
 
     void OnPrimaryLongPress() {
         auto& client = VoiceLabClient::GetInstance();

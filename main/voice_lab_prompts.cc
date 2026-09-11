@@ -64,6 +64,25 @@ bool SpeakVoiceLabPrompt(VoiceLabPrompt prompt) {
         case VoiceLabPrompt::Connected:
             sound = Lang::Sounds::OGG_VL_CONNECTED;
             break;
+        case VoiceLabPrompt::BindingCode: {
+            const auto code = client.GetBindingCode();
+            if (code.size() != 8)
+                return false;
+            audio.PlaySound(Lang::Sounds::OGG_VL_BINDING_CODE);
+            const std::string_view digits[] = {
+                Lang::Sounds::OGG_0, Lang::Sounds::OGG_1, Lang::Sounds::OGG_2, Lang::Sounds::OGG_3,
+                Lang::Sounds::OGG_4, Lang::Sounds::OGG_5, Lang::Sounds::OGG_6, Lang::Sounds::OGG_7,
+                Lang::Sounds::OGG_8, Lang::Sounds::OGG_9};
+            for (char digit : code) {
+                if (digit < '0' || digit > '9')
+                    return false;
+                audio.PlaySound(digits[digit - '0']);
+            }
+            return DrainPrompt(audio);
+        }
+        case VoiceLabPrompt::BindingDone:
+            sound = Lang::Sounds::OGG_VL_BINDING_DONE;
+            break;
         case VoiceLabPrompt::RecordingStarted:
             sound = Lang::Sounds::OGG_VL_RECORDING_START;
             break;
