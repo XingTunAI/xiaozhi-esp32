@@ -15,6 +15,7 @@
 #include "protocol.h"
 #include "voice_lab_recording_guard.h"
 #include "voice_lab_recording_lease.h"
+#include "voice_lab_pcm_buffer.h"
 
 #include <web_socket.h>
 
@@ -61,8 +62,9 @@ private:
     // Bound retained audio by duration, independent of variable packet sizes.
     static constexpr uint64_t kMaxUnacknowledgedSamples = kAudioSampleRate * 4;
 #if CONFIG_SPIRAM
-    // Four seconds of capture absorbs short Wi-Fi/TLS stalls on PSRAM boards.
-    static constexpr int kMaxPendingPcmFrames = 4000 / kAudioFrameDurationMs;
+    // Fixed 384 KB PSRAM budget: tolerate observed multi-second transport stalls
+    // without persisting recordings or delaying the normal immediate send path.
+    static constexpr int kMaxPendingPcmFrames = 12000 / kAudioFrameDurationMs;
 #else
     static constexpr int kMaxPendingPcmFrames = 1000 / kAudioFrameDurationMs;
 #endif
@@ -129,7 +131,7 @@ private:
     uint64_t audio_frames_sent_ = 0;
     uint64_t audio_bytes_sent_ = 0;
     uint64_t last_audio_stats_us_ = 0;
-    std::vector<int16_t> pending_audio_pcm_;
+    VoiceLabPcmBuffer pending_audio_pcm_;
     struct PendingPacket {
         std::string bytes;
         uint64_t sample_end;

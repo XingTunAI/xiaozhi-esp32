@@ -1327,7 +1327,18 @@ bool VoiceLabClient::StartAuthorizedRecording(const std::string& recording_id,
             pending_audio_pcm_.clear();
             // Allocate before microphone capture, avoiding reallocations in
             // the producer when a socket write briefly falls behind.
-            pending_audio_pcm_.reserve(kMaxPendingPcmFrames * kPcmSamplesPerFrame);
+#if CONFIG_SPIRAM
+            constexpr uint32_t pcm_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+#else
+            constexpr uint32_t pcm_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+#endif
+            if (!pending_audio_pcm_.Allocate(kMaxPendingPcmFrames * kPcmSamplesPerFrame,
+                                             pcm_caps)) {
+                ESP_LOGE(TAG, "Unable to allocate bounded PCM buffer; capture remains disabled");
+                CloseAudioLocked();
+                SetUserState(UserState::Error);
+                return false;
+            }
         }
         unacknowledged_audio_.clear();
         acknowledged_sample_end_.store(sample_start_);
@@ -1450,15 +1461,25 @@ bool VoiceLabClient::StopRecording() {
     bool tail_sent = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (audio_websocket_ != nullptr && audio_websocket_->IsConnected()) {
-            for (int i = 0; i < kMaxPendingPcmFrames; ++i) {
-                if (!FlushPendingAudioLocked()) {
-                    interrupted_.store(true);
+        tail_sent = audio_websocket_ != nullptr && audio_websocket_->IsConnected();
+    }
+    for (int i = 0; tail_sent && i < kMaxPendingPcmFrames; ++i) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            {
+                std::lock_guard<std::mutex> pcm_lock(pcm_mutex_);
+                if (pending_audio_pcm_.empty())
                     break;
-                }
             }
-            tail_sent = true;
+            if (!FlushPendingAudioLocked()) {
+                interrupted_.store(true);
+                tail_sent = false;
+                break;
+            }
         }
+        // Drain at up to twice capture speed, yielding both the transport lock
+        // and CPU so heartbeats and server ingestion can progress during stop.
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
     // Give the cutoff packet a bounded retry opportunity before `end`. The
     // existing server drains and closes after `end`, so never send PCM after it.
@@ -1585,7 +1606,10 @@ bool VoiceLabClient::SendPcmAudio(std::vector<int16_t>&& pcm) {
         AbortRecording();
         return false;
     }
-    pending_audio_pcm_.insert(pending_audio_pcm_.end(), pcm.begin(), pcm.end());
+    if (!pending_audio_pcm_.Push(pcm.data(), pcm.size())) {
+        AbortRecording();
+        return false;
+    }
     first_pcm_received_.store(true);
     // The control worker sends available frames without waiting to fill a batch.
     // Never perform socket I/O in the
@@ -1621,10 +1645,11 @@ bool VoiceLabClient::FlushPendingAudioLocked() {
         return false;
     }
 
-    std::vector<int16_t> batch(pending_audio_pcm_.begin(),
-                               pending_audio_pcm_.begin() + samples_to_send);
-    pending_audio_pcm_.erase(pending_audio_pcm_.begin(),
-                             pending_audio_pcm_.begin() + samples_to_send);
+    std::vector<int16_t> batch(samples_to_send);
+    if (!pending_audio_pcm_.Pop(batch.data(), samples_to_send)) {
+        AbortRecording();
+        return false;
+    }
     const size_t remaining_frames = pending_audio_pcm_.size() / kPcmSamplesPerFrame;
     pcm_lock.unlock();
     auto packet = BuildPcmPacket(batch, audio_sequence_, sample_start_);
