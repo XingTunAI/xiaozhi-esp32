@@ -12,7 +12,9 @@ namespace {
 std::mutex prompt_mutex;
 
 bool DrainPrompt(AudioService& audio) {
-    const auto deadline = esp_timer_get_time() + 8000000;
+    // First-use instructions contain several short steps; do not start a
+    // confirmation countdown while the tail of the instruction is still playing.
+    const auto deadline = esp_timer_get_time() + 20000000;
     while (!audio.IsPlaybackIdle() && esp_timer_get_time() < deadline) {
         vTaskDelay(pdMS_TO_TICKS(20));
     }
@@ -89,6 +91,12 @@ bool SpeakVoiceLabPrompt(VoiceLabPrompt prompt) {
             break;
         case VoiceLabPrompt::ResetConfirm:
             sound = Lang::Sounds::OGG_VL_RESET_CONFIRM;
+            break;
+        case VoiceLabPrompt::ResetWorking:
+            sound = Lang::Sounds::OGG_VL_RESET_WORKING;
+            break;
+        case VoiceLabPrompt::ResetCancelled:
+            sound = Lang::Sounds::OGG_VL_RESET_CANCELLED;
             break;
         case VoiceLabPrompt::ResetDone:
             sound = Lang::Sounds::OGG_VL_RESET_DONE;

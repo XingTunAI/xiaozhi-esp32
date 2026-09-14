@@ -7,6 +7,8 @@ enum class VoiceLabPrompt {
     BindingCode,
     BindingDone,
     ResetConfirm,
+    ResetWorking,
+    ResetCancelled,
     ResetDone,
     ResetFailed,
     RecordingStarted,

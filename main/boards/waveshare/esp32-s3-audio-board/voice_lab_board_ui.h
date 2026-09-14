@@ -17,6 +17,7 @@
 #include "wifi_manager.h"
 
 inline std::atomic<int64_t> waveshare_reset_confirm_until_us{0};
+inline std::atomic<bool> waveshare_reset_working{false};
 
 // Customer indicators belong to this board. Voice-assistant listening and VAD
 // never imply that Voice Lab is recording.
@@ -82,6 +83,7 @@ private:
         Connecting,
         Configuring,
         ResetConfirm,
+        ResetWorking,
         Ready,
         Recording,
         Error
@@ -95,6 +97,8 @@ private:
                 return "configuring";
             case Indicator::ResetConfirm:
                 return "reset_confirmation";
+            case Indicator::ResetWorking:
+                return "reset_working";
             case Indicator::Ready:
                 return "ready";
             case Indicator::Recording:
@@ -117,8 +121,16 @@ private:
         if (client.IsRecording()) {
             return Indicator::Recording;
         }
-        if (esp_timer_get_time() < waveshare_reset_confirm_until_us.load())
+        if (waveshare_reset_working.load() || client.IsFactoryResetActive())
+            return Indicator::ResetWorking;
+        auto confirm_until = waveshare_reset_confirm_until_us.load();
+        if (confirm_until == -1 || esp_timer_get_time() < confirm_until)
             return Indicator::ResetConfirm;
+        if (confirm_until > 0 &&
+            waveshare_reset_confirm_until_us.compare_exchange_strong(confirm_until, 0)) {
+            ESP_LOGI("WaveshareReset", "Confirmation expired without changes");
+            QueueVoiceLabPrompt(VoiceLabPrompt::ResetCancelled);
+        }
         auto state = Application::GetInstance().GetDeviceState();
         auto network = network_.load();
         if (WifiManager::GetInstance().IsConfigMode()) {
@@ -158,6 +170,9 @@ private:
                 case Indicator::ResetConfirm:
                     SetAllColor({24, 16, 0});
                     Blink({24, 16, 0}, 150);
+                    break;
+                case Indicator::ResetWorking:
+                    SetAllColor({24, 16, 0});
                     break;
                 case Indicator::Configuring:
                     SetAllColor({24, 16, 0});
@@ -208,9 +223,7 @@ public:
                         QueueVoiceLabPrompt(VoiceLabPrompt::ResetFailed);
                         return;
                     }
-                    waveshare_reset_confirm_until_us.store(esp_timer_get_time() + 20000000);
-                    ShowHint("恢复出厂将解绑并清 Wi-Fi；20 秒内短按 K2 确认");
-                    QueueVoiceLabPrompt(VoiceLabPrompt::ResetConfirm);
+                    BeginResetConfirmation();
                 } else {
                     waveshare_reset_confirm_until_us.store(0);
                     RequestWifiConfig();
@@ -222,7 +235,10 @@ public:
                 return;
             }
             Application::GetInstance().Schedule([this]() {
-                waveshare_reset_confirm_until_us.store(0);
+                if (waveshare_reset_confirm_until_us.exchange(0) != 0) {
+                    QueueVoiceLabPrompt(VoiceLabPrompt::ResetCancelled);
+                    return;
+                }
                 if (WifiManager::GetInstance().IsConfigMode()) {
                     ShowHint("请用手机连接设备热点完成配网");
                     QueueVoiceLabPrompt(VoiceLabPrompt::WifiSetup);
@@ -236,7 +252,11 @@ public:
     // The expander scanner dispatches these methods on the application task.
     // Short presses do not change capture or play sound into a recording.
     void OnPrimaryClick() {
-        if (esp_timer_get_time() < waveshare_reset_confirm_until_us.exchange(0)) {
+        if (action_pending_)
+            return;
+        const auto deadline = waveshare_reset_confirm_until_us.exchange(0);
+        if (deadline == -1 || esp_timer_get_time() < deadline) {
+            ESP_LOGI("WaveshareReset", "K2 confirmation received");
             if (!action_pending_)
                 RunWorker(Action::FactoryReset);
             return;
@@ -248,7 +268,8 @@ public:
     }
 
     void OnPrimaryLongPress() {
-        if (esp_timer_get_time() < waveshare_reset_confirm_until_us.load())
+        const auto deadline = waveshare_reset_confirm_until_us.load();
+        if (deadline == -1 || esp_timer_get_time() < deadline)
             return;  // Confirmation is a short click, never a recording start.
         auto& client = VoiceLabClient::GetInstance();
         if (client.IsRecording()) {
@@ -288,7 +309,37 @@ private:
     // socket flushing; a long press during a stop is retained for completion.
     bool action_pending_ = false;
     bool wifi_requested_ = false;
+    bool reset_prompt_pending_ = false;
     Action worker_action_ = Action::Stop;
+
+    void BeginResetConfirmation() {
+        if (reset_prompt_pending_)
+            return;
+        reset_prompt_pending_ = true;
+        // -1 accepts an intentional K2 click during the instruction. The full
+        // twenty seconds only start once that instruction has finished playing.
+        waveshare_reset_confirm_until_us.store(-1);
+        const auto created = xTaskCreate(
+            [](void* arg) {
+                auto* controls = static_cast<WaveshareVoiceLabButtons*>(arg);
+                SpeakVoiceLabPrompt(VoiceLabPrompt::ResetConfirm);
+                Application::GetInstance().Schedule([controls]() {
+                    controls->reset_prompt_pending_ = false;
+                    int64_t pending = -1;
+                    if (waveshare_reset_confirm_until_us.compare_exchange_strong(
+                            pending, esp_timer_get_time() + 20000000)) {
+                        ESP_LOGI("WaveshareReset", "Prompt finished; confirmation window opened");
+                    }
+                });
+                vTaskDelete(nullptr);
+            },
+            "vl_reset_prompt", 4096, this, 2, nullptr);
+        if (created != pdPASS) {
+            reset_prompt_pending_ = false;
+            waveshare_reset_confirm_until_us.store(0);
+            QueueVoiceLabPrompt(VoiceLabPrompt::ResetFailed);
+        }
+    }
 
     static void ShowHint(const char* text) {
         auto* display = Board::GetInstance().GetDisplay();
@@ -319,6 +370,10 @@ private:
     void RunWorker(Action action) {
         action_pending_ = true;
         worker_action_ = action;
+        if (action == Action::FactoryReset) {
+            waveshare_reset_working.store(true);
+            ShowHint("正在恢复出厂，请保持通电，等待设备自动重启");
+        }
         if (action == Action::Reconfigure) {
             wifi_requested_ = false;
         }
@@ -327,6 +382,8 @@ private:
                 auto* controls = static_cast<WaveshareVoiceLabButtons*>(arg);
                 const auto action = controls->worker_action_;
                 auto& client = VoiceLabClient::GetInstance();
+                if (action == Action::FactoryReset)
+                    SpeakVoiceLabPrompt(VoiceLabPrompt::ResetWorking);
                 const bool success =
                     action == Action::FactoryReset   ? client.RestoreFactorySettings()
                     : action == Action::RequestStart ? client.RequestStartRecording()
@@ -336,6 +393,7 @@ private:
                                                 : VoiceLabPrompt::ResetFailed);
                     if (success)
                         esp_restart();
+                    waveshare_reset_working.store(false);
                 }
                 if (action == Action::Reconfigure) {
                     client.StopPlayback();
@@ -366,6 +424,10 @@ private:
             },
             "vl_board_action", 8192, this, 2, nullptr);
         if (result != pdPASS) {
+            if (action == Action::FactoryReset) {
+                waveshare_reset_working.store(false);
+                QueueVoiceLabPrompt(VoiceLabPrompt::ResetFailed);
+            }
             action_pending_ = false;
             wifi_requested_ = false;
             ShowHint("操作未完成，请稍后重试");

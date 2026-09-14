@@ -48,6 +48,7 @@ public:
     void ResetVoiceLabSettings();
     // Worker task only; keep local credentials if the server cannot confirm.
     bool RestoreFactorySettings();
+    bool IsFactoryResetActive() const { return factory_reset_active_.load(); }
     bool StartRecording(const std::string& recording_id = "",
                         const std::string& mode = "meeting_live");
     bool RequestStartRecording();

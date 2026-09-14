@@ -1,5 +1,5 @@
 ﻿param(
-    [Parameter(Mandatory = $true)][string]$Ffmpeg,
+    [Parameter(Mandatory = $true)][Alias("FfmpegPath")][string]$Ffmpeg,
     [string]$Voice = 'Microsoft Huihui Desktop',
     [string[]]$Only = @()
 )
@@ -23,6 +23,10 @@ $prompts = [ordered]@{
     vl_start_failed = '暂时无法开始录音，请在网页查看设备状态。'
     vl_interrupted = '录音已停止，请在网页检查本次结果。'
 }
+# First-use copy is shared with the customer delivery documentation.
+$copyPath = Join-Path $PSScriptRoot '../docs/voice-lab-prompt-copy.json'
+$copy = Get-Content -LiteralPath $copyPath -Raw -Encoding UTF8 | ConvertFrom-Json
+foreach ($entry in $copy.PSObject.Properties) { $prompts[$entry.Name] = [string]$entry.Value }
 $temporary = [IO.Path]::GetTempFileName()
 $synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
 try {
