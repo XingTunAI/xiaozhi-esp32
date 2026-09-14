@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Mandatory = $true)][string]$Ffmpeg,
     [string]$Voice = 'Microsoft Huihui Desktop',
     [string[]]$Only = @()
@@ -12,6 +12,9 @@ $prompts = [ordered]@{
     vl_connected = '已连接网络。'
     vl_binding_code = '请登录听见，在我的设备中选择添加设备。五分钟内输入八位绑定码。绑定码是。'
     vl_binding_done = '设备绑定成功。请在网页查看服务状态。'
+    vl_reset_confirm = '恢复出厂将解除绑定，并清除网络。请在二十秒内短按 K2 确认。不操作则取消。'
+    vl_reset_done = '恢复出厂成功。即将重启，请重新配网和绑定。'
+    vl_reset_failed = '恢复出厂未完成。请先连接网络，结束录音，再重试。原来的设置已保留。'
     vl_recording_start = '开始会议录音。'
     vl_recording_stop = '录音已停止。'
     vl_recording_pause = '录音已暂停。'

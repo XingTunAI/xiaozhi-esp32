@@ -87,6 +87,15 @@ bool SpeakVoiceLabPrompt(VoiceLabPrompt prompt) {
         case VoiceLabPrompt::BindingDone:
             sound = Lang::Sounds::OGG_VL_BINDING_DONE;
             break;
+        case VoiceLabPrompt::ResetConfirm:
+            sound = Lang::Sounds::OGG_VL_RESET_CONFIRM;
+            break;
+        case VoiceLabPrompt::ResetDone:
+            sound = Lang::Sounds::OGG_VL_RESET_DONE;
+            break;
+        case VoiceLabPrompt::ResetFailed:
+            sound = Lang::Sounds::OGG_VL_RESET_FAILED;
+            break;
         case VoiceLabPrompt::RecordingStarted:
             sound = Lang::Sounds::OGG_VL_RECORDING_START;
             break;

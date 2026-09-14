@@ -304,15 +304,22 @@ bool VoiceLabClient::PairWithEnrollmentCode(const std::string& enrollment_code) 
 
 void VoiceLabClient::ClearPairing() {
     Disconnect();
+    customer_bound_.store(false);
+    {
+        std::lock_guard<std::mutex> lock(binding_mutex_);
+        binding_code_.clear();
+        binding_code_deadline_us_ = 0;
+    }
     Settings settings("voice_lab", true);
     settings.EraseKey("device_token");
     settings.EraseKey("token");
     settings.EraseKey("enrollment_code");
+    settings.EraseKey("claim_pending");
     ESP_LOGI(TAG, "Voice Lab pairing state cleared from NVS");
 }
 
 void VoiceLabClient::ResetVoiceLabSettings() {
-    Disconnect();
+    ClearPairing();
     SsidManager::GetInstance().Clear();
 
     Settings settings("voice_lab", true);
@@ -328,6 +335,44 @@ void VoiceLabClient::ResetVoiceLabSettings() {
     settings.EraseKey("audio_frontend");
     settings.EraseKey("auto_connect");
     ESP_LOGI(TAG, "Voice Lab settings and saved Wi-Fi credentials reset from NVS");
+}
+
+bool VoiceLabClient::RestoreFactorySettings() {
+    bool expected = false;
+    if (!factory_reset_active_.compare_exchange_strong(expected, true))
+        return false;
+    const auto state = GetUserState();
+    if (IsRecording() || state == UserState::Starting || state == UserState::Requesting ||
+        state == UserState::Stopping || tail_pending_.load()) {
+        factory_reset_active_.store(false);
+        return false;
+    }
+    // Drain the existing claim/connect worker before changing persistent
+    // identity: it must not write an old credential after reset.
+    Disconnect();
+    const auto deadline = esp_timer_get_time() + 15000000;
+    while ((connecting_.load() || binding_active_.load()) && esp_timer_get_time() < deadline)
+        vTaskDelay(pdMS_TO_TICKS(50));
+    bool ok = !connecting_.load() && !binding_active_.load();
+    const auto token = GetDeviceToken();
+    if (ok && !token.empty()) {
+        ok = WifiManager::GetInstance().IsConnected() && EnsureSystemTimeForTls(IsTlsEnabled());
+        if (ok) {
+            int status = 0;
+            auto* reply = BindingHttp("release", "", token, status);
+            auto* result = cJSON_GetObjectItem(reply, "state");
+            ok = status == 200 && cJSON_IsString(result) &&
+                 strcmp(result->valuestring, "released") == 0;
+            cJSON_Delete(reply);
+        }
+    }
+    if (ok) {
+        ResetVoiceLabSettings();
+        return true;
+    }
+    factory_reset_active_.store(false);
+    ConnectAsync();
+    return false;
 }
 
 bool VoiceLabClient::EnrollIfNeeded() {
@@ -476,6 +521,8 @@ std::string VoiceLabClient::GetBindingCode() const {
 }
 
 void VoiceLabClient::BeginCustomerBinding() {
+    if (factory_reset_active_.load())
+        return;
     std::unique_lock<std::mutex> operation(recording_mutex_, std::try_to_lock);
     if (!operation.owns_lock())
         return;
@@ -608,6 +655,8 @@ bool VoiceLabClient::RunCustomerBinding(const std::string& existing_token) {
 bool VoiceLabClient::IsConnected() const { return connected_.load(); }
 
 void VoiceLabClient::ConnectAsync() {
+    if (factory_reset_active_.load())
+        return;
     if (!IsAutoConnectEnabled() || GetConfiguredHost().empty()) {
         return;
     }
@@ -650,6 +699,24 @@ bool VoiceLabClient::Connect() {
     }
     if (generation != connection_generation_.load() || manual_disconnect_.load())
         return false;
+    const auto existing_token = GetDeviceToken();
+    if (!existing_token.empty()) {
+        int status = 0;
+        auto* reply = BindingHttp("status", "", existing_token, status);
+        auto* state = cJSON_GetObjectItem(reply, "state");
+        const bool released =
+            status == 200 && cJSON_IsString(state) && strcmp(state->valuestring, "released") == 0;
+        cJSON_Delete(reply);
+        if (generation != connection_generation_.load() || manual_disconnect_.load())
+            return false;
+        if (released) {
+            ClearPairing();
+            // Reboot also clears all in-memory lease/revision/binding state.
+            // Wi-Fi stays intact, so the next boot enters fresh claiming.
+            esp_restart();
+            return false;
+        }
+    }
     if (!EnrollIfNeeded()) {
         return false;
     }
@@ -1043,7 +1110,8 @@ void VoiceLabClient::EnsureHeartbeatTask() {
                 if (!client->IsAutoConnectEnabled() || client->GetConfiguredHost().empty()) {
                     continue;
                 }
-                if (client->manual_disconnect_.load()) {
+                if (client->manual_disconnect_.load() || client->connecting_.load() ||
+                    client->binding_active_.load()) {
                     continue;
                 }
                 if (client->IsConnected()) {
@@ -1264,8 +1332,8 @@ bool VoiceLabClient::StartRecording(const std::string& recording_id, const std::
 }
 
 bool VoiceLabClient::RequestStartRecording() {
-    if (binding_active_.load() || !IsConnected() || recording_.load() || tail_pending_.load() ||
-        GetUserState() == UserState::Starting) {
+    if (factory_reset_active_.load() || binding_active_.load() || !IsConnected() ||
+        recording_.load() || tail_pending_.load() || GetUserState() == UserState::Starting) {
         QueueVoiceLabPrompt(VoiceLabPrompt::StartFailed);
         return false;
     }

@@ -46,6 +46,8 @@ public:
     std::string GetBindingCode() const;
     void ClearPairing();
     void ResetVoiceLabSettings();
+    // Worker task only; keep local credentials if the server cannot confirm.
+    bool RestoreFactorySettings();
     bool StartRecording(const std::string& recording_id = "",
                         const std::string& mode = "meeting_live");
     bool RequestStartRecording();
@@ -78,6 +80,7 @@ private:
     mutable std::mutex binding_mutex_;
     std::atomic<bool> binding_active_{false};
     std::atomic<bool> customer_bound_{false};
+    std::atomic<bool> factory_reset_active_{false};
     std::string binding_code_;
     int64_t binding_code_deadline_us_ = 0;
     std::mutex recording_mutex_;

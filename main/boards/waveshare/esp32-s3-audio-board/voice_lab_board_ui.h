@@ -16,6 +16,8 @@
 #include "voice_lab_prompts.h"
 #include "wifi_manager.h"
 
+inline std::atomic<int64_t> waveshare_reset_confirm_until_us{0};
+
 // Customer indicators belong to this board. Voice-assistant listening and VAD
 // never imply that Voice Lab is recording.
 class WaveshareVoiceLabStrip : public CircularStrip {
@@ -75,7 +77,15 @@ public:
 
 private:
     enum class NetworkStatus { Connecting, Connected, Disconnected, Configuring };
-    enum class Indicator { Unknown, Connecting, Configuring, Ready, Recording, Error };
+    enum class Indicator {
+        Unknown,
+        Connecting,
+        Configuring,
+        ResetConfirm,
+        Ready,
+        Recording,
+        Error
+    };
 
     static const char* IndicatorName(Indicator state) {
         switch (state) {
@@ -83,6 +93,8 @@ private:
                 return "connecting";
             case Indicator::Configuring:
                 return "configuring";
+            case Indicator::ResetConfirm:
+                return "reset_confirmation";
             case Indicator::Ready:
                 return "ready";
             case Indicator::Recording:
@@ -105,6 +117,8 @@ private:
         if (client.IsRecording()) {
             return Indicator::Recording;
         }
+        if (esp_timer_get_time() < waveshare_reset_confirm_until_us.load())
+            return Indicator::ResetConfirm;
         auto state = Application::GetInstance().GetDeviceState();
         auto network = network_.load();
         if (WifiManager::GetInstance().IsConfigMode()) {
@@ -141,6 +155,10 @@ private:
             // The board specifies its wire order in the constructor. All
             // effects below use semantic RGB and nonzero recording brightness.
             switch (next) {
+                case Indicator::ResetConfirm:
+                    SetAllColor({24, 16, 0});
+                    Blink({24, 16, 0}, 150);
+                    break;
                 case Indicator::Configuring:
                     SetAllColor({24, 16, 0});
                     Blink({24, 16, 0}, 500);
@@ -170,17 +188,41 @@ class WaveshareVoiceLabButtons {
 public:
     void Bind(Button& button, std::function<void()> enter_wifi) {
         enter_wifi_ = std::move(enter_wifi);
-        button.OnPressDown([this]() { long_press_handled_.store(false); });
-        button.OnLongPress([this]() {
-            if (!long_press_handled_.exchange(true)) {
-                Application::GetInstance().Schedule([this]() { RequestWifiConfig(); });
-            }
+        button.OnPressDown([this]() {
+            long_press_handled_.store(false);
+            boot_pressed_at_us_.store(esp_timer_get_time());
+        });
+        button.OnLongPress([this]() { long_press_handled_.store(true); });
+        button.OnPressUp([this]() {
+            const auto elapsed = esp_timer_get_time() - boot_pressed_at_us_.load();
+            if (elapsed < 3000000)
+                return;
+            long_press_handled_.store(true);
+            Application::GetInstance().Schedule([this, elapsed]() {
+                if (elapsed >= 10000000) {
+                    auto& client = VoiceLabClient::GetInstance();
+                    if (action_pending_ || client.IsRecording() ||
+                        client.GetUserState() == VoiceLabClient::UserState::Starting ||
+                        client.GetUserState() == VoiceLabClient::UserState::Requesting ||
+                        client.GetUserState() == VoiceLabClient::UserState::Stopping) {
+                        QueueVoiceLabPrompt(VoiceLabPrompt::ResetFailed);
+                        return;
+                    }
+                    waveshare_reset_confirm_until_us.store(esp_timer_get_time() + 20000000);
+                    ShowHint("恢复出厂将解绑并清 Wi-Fi；20 秒内短按 K2 确认");
+                    QueueVoiceLabPrompt(VoiceLabPrompt::ResetConfirm);
+                } else {
+                    waveshare_reset_confirm_until_us.store(0);
+                    RequestWifiConfig();
+                }
+            });
         });
         button.OnClick([this]() {
             if (long_press_handled_.load()) {
                 return;
             }
             Application::GetInstance().Schedule([this]() {
+                waveshare_reset_confirm_until_us.store(0);
                 if (WifiManager::GetInstance().IsConfigMode()) {
                     ShowHint("请用手机连接设备热点完成配网");
                     QueueVoiceLabPrompt(VoiceLabPrompt::WifiSetup);
@@ -194,6 +236,11 @@ public:
     // The expander scanner dispatches these methods on the application task.
     // Short presses do not change capture or play sound into a recording.
     void OnPrimaryClick() {
+        if (esp_timer_get_time() < waveshare_reset_confirm_until_us.exchange(0)) {
+            if (!action_pending_)
+                RunWorker(Action::FactoryReset);
+            return;
+        }
         auto& client = VoiceLabClient::GetInstance();
         if (!client.IsRecording())
             client.BeginCustomerBinding();
@@ -201,6 +248,8 @@ public:
     }
 
     void OnPrimaryLongPress() {
+        if (esp_timer_get_time() < waveshare_reset_confirm_until_us.load())
+            return;  // Confirmation is a short click, never a recording start.
         auto& client = VoiceLabClient::GetInstance();
         if (client.IsRecording()) {
             if (!action_pending_) {
@@ -231,9 +280,10 @@ public:
     }
 
 private:
-    enum class Action { Stop, Reconfigure, RequestStart };
+    enum class Action { Stop, Reconfigure, RequestStart, FactoryReset };
     std::function<void()> enter_wifi_;
     std::atomic<bool> long_press_handled_{false};
+    std::atomic<int64_t> boot_pressed_at_us_{0};
     // Only the application task changes action scheduling. One worker handles
     // socket flushing; a long press during a stop is retained for completion.
     bool action_pending_ = false;
@@ -277,15 +327,25 @@ private:
                 auto* controls = static_cast<WaveshareVoiceLabButtons*>(arg);
                 const auto action = controls->worker_action_;
                 auto& client = VoiceLabClient::GetInstance();
-                const bool success = action == Action::RequestStart ? client.RequestStartRecording()
-                                                                    : client.StopRecording();
+                const bool success =
+                    action == Action::FactoryReset   ? client.RestoreFactorySettings()
+                    : action == Action::RequestStart ? client.RequestStartRecording()
+                                                     : client.StopRecording();
+                if (action == Action::FactoryReset) {
+                    SpeakVoiceLabPrompt(success ? VoiceLabPrompt::ResetDone
+                                                : VoiceLabPrompt::ResetFailed);
+                    if (success)
+                        esp_restart();
+                }
                 if (action == Action::Reconfigure) {
                     client.StopPlayback();
                     client.Disconnect();
                 }
                 Application::GetInstance().Schedule([controls, action, success]() {
                     controls->action_pending_ = false;
-                    if (action == Action::Reconfigure) {
+                    if (action == Action::FactoryReset) {
+                        ShowHint("恢复出厂未完成，请先联网并结束录音后重试");
+                    } else if (action == Action::Reconfigure) {
                         controls->wifi_requested_ = false;
                         controls->enter_wifi_();
                     } else if (controls->wifi_requested_) {
@@ -304,7 +364,7 @@ private:
                 });
                 vTaskDelete(nullptr);
             },
-            "vl_board_action", 6144, this, 2, nullptr);
+            "vl_board_action", 8192, this, 2, nullptr);
         if (result != pdPASS) {
             action_pending_ = false;
             wifi_requested_ = false;
