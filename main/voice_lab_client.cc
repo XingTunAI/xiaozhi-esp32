@@ -13,10 +13,10 @@
 #include <esp_app_desc.h>
 #include <esp_heap_caps.h>
 #include <esp_log.h>
+#include <esp_random.h>
 #include <esp_rom_sys.h>
 #include <esp_sntp.h>
 #include <esp_system.h>
-#include <esp_random.h>
 #include <esp_timer.h>
 #include <cJSON.h>
 #include <freertos/FreeRTOS.h>
@@ -315,6 +315,7 @@ void VoiceLabClient::ClearPairing() {
     settings.EraseKey("token");
     settings.EraseKey("enrollment_code");
     settings.EraseKey("claim_pending");
+    settings.EraseKey("claim_proof");
     ESP_LOGI(TAG, "Voice Lab pairing state cleared from NVS");
 }
 
@@ -364,6 +365,19 @@ bool VoiceLabClient::RestoreFactorySettings() {
             ok = status == 200 && cJSON_IsString(result) &&
                  strcmp(result->valuestring, "released") == 0;
             cJSON_Delete(reply);
+        }
+    } else if (ok) {
+        const auto proof = Settings("voice_lab", false).GetString("claim_proof");
+        if (!proof.empty()) {
+            ok = WifiManager::GetInstance().IsConnected() && EnsureSystemTimeForTls(IsTlsEnabled());
+            if (ok) {
+                int status = 0;
+                auto* reply = BindingHttp("cancel", proof, "", status);
+                auto* result = cJSON_GetObjectItem(reply, "state");
+                ok = status == 200 && cJSON_IsString(result) &&
+                     strcmp(result->valuestring, "cancelled") == 0;
+                cJSON_Delete(reply);
+            }
         }
     }
     if (ok) {
@@ -509,6 +523,7 @@ bool VoiceLabClient::ConfirmPendingBinding() {
     if (ok) {
         Settings saved("voice_lab", true);
         saved.EraseKey("claim_pending");
+        saved.EraseKey("claim_proof");
         saved.EraseKey("enrollment_code");
         customer_bound_.store(true);
     }
@@ -558,15 +573,31 @@ bool VoiceLabClient::RunCustomerBinding(const std::string& existing_token) {
     if (!EnsureSystemTimeForTls(IsTlsEnabled()))
         return false;
     const auto generation = connection_generation_.load();
-    uint8_t random[32];
-    esp_fill_random(random, sizeof(random));
-    const char hex[] = "0123456789abcdef";
-    std::string proof;
-    proof.reserve(64);
-    for (auto value : random) {
-        proof.push_back(hex[value >> 4]);
-        proof.push_back(hex[value & 15]);
+    auto proof = Settings("voice_lab", false).GetString("claim_proof");
+    if (proof.empty()) {
+        uint8_t random[32];
+        esp_fill_random(random, sizeof(random));
+        const char hex[] = "0123456789abcdef";
+        proof.reserve(64);
+        for (auto value : random) {
+            proof.push_back(hex[value >> 4]);
+            proof.push_back(hex[value & 15]);
+        }
+        // Persist before sending: a lost response or reboot must reuse this
+        // exact pending request, and factory reset needs its cancellation proof.
+        nvs_handle_t nvs = 0;
+        esp_err_t saved = nvs_open("voice_lab", NVS_READWRITE, &nvs);
+        if (saved == ESP_OK) {
+            saved = nvs_set_str(nvs, "claim_proof", proof.c_str());
+            if (saved == ESP_OK)
+                saved = nvs_commit(nvs);
+            nvs_close(nvs);
+        }
+        if (saved != ESP_OK)
+            return false;
     }
+    if (proof.size() != 64 || proof.find_first_not_of("0123456789abcdef") != std::string::npos)
+        return false;
     int status = 0;
     auto* reply = BindingHttp("start", proof, existing_token, status);
     auto* state = cJSON_GetObjectItem(reply, "state");
@@ -578,22 +609,27 @@ bool VoiceLabClient::RunCustomerBinding(const std::string& existing_token) {
     }
     auto* code = cJSON_GetObjectItem(reply, "code");
     auto* expires = cJSON_GetObjectItem(reply, "expiresInSeconds");
-    if (status != 200 || !cJSON_IsString(code) || strlen(code->valuestring) != 8 ||
-        strspn(code->valuestring, "0123456789") != 8 || !cJSON_IsNumber(expires) ||
-        expires->valueint <= 0 || expires->valueint > 300) {
+    const bool resume_claimed =
+        status == 200 && cJSON_IsString(state) && strcmp(state->valuestring, "claimed") == 0;
+    if (!resume_claimed &&
+        (status != 200 || !cJSON_IsString(code) || strlen(code->valuestring) != 8 ||
+         strspn(code->valuestring, "0123456789") != 8 || !cJSON_IsNumber(expires) ||
+         expires->valueint <= 0 || expires->valueint > 300)) {
         cJSON_Delete(reply);
         ESP_LOGW(TAG, "Customer binding unavailable, HTTP status=%d", status);
         return false;
     }
-    const auto deadline = esp_timer_get_time() + int64_t(expires->valueint) * 1000000;
-    {
+    const auto deadline =
+        esp_timer_get_time() + int64_t(resume_claimed ? 300 : expires->valueint) * 1000000;
+    if (!resume_claimed) {
         std::lock_guard<std::mutex> lock(binding_mutex_);
         binding_code_ = code->valuestring;
         binding_code_deadline_us_ = deadline;
     }
     cJSON_Delete(reply);
     SetUserState(UserState::Connecting);
-    QueueVoiceLabPrompt(VoiceLabPrompt::BindingCode);
+    if (!resume_claimed)
+        QueueVoiceLabPrompt(VoiceLabPrompt::BindingCode);
     bool confirmed = false;
     while (esp_timer_get_time() < deadline && generation == connection_generation_.load() &&
            !manual_disconnect_.load() && WifiManager::GetInstance().IsConnected()) {
@@ -670,13 +706,26 @@ void VoiceLabClient::ConnectAsync() {
     if (!connecting_.compare_exchange_strong(expected, true)) {
         return;
     }
+    int64_t unset = 0;
+    connection_wait_started_us_.compare_exchange_strong(unset, esp_timer_get_time());
+    if (esp_timer_get_time() - connection_wait_started_us_.load() < 60000000)
+        SetUserState(UserState::Connecting);
 
     xTaskCreate(
         [](void* arg) {
             auto* client = static_cast<VoiceLabClient*>(arg);
             bool connected = client->Connect();
-            if (!connected)
-                client->SetUserState(UserState::Error);
+            if (connected) {
+                client->connection_wait_started_us_.store(0);
+            } else if (!client->manual_disconnect_.load()) {
+                const bool timed_out =
+                    esp_timer_get_time() - client->connection_wait_started_us_.load() >= 60000000;
+                const bool announce_failure =
+                    timed_out && client->GetUserState() != UserState::Error;
+                client->SetUserState(timed_out ? UserState::Error : UserState::Connecting);
+                if (announce_failure)
+                    QueueVoiceLabPrompt(VoiceLabPrompt::ConnectionFailed);
+            }
             client->connecting_.store(false);
             if (!connected && !client->manual_disconnect_.load()) {
                 client->ScheduleReconnect();
@@ -897,6 +946,7 @@ void VoiceLabClient::CloseAudioLocked() {
 
 void VoiceLabClient::Disconnect() {
     manual_disconnect_.store(true);
+    connection_wait_started_us_.store(0);
     connection_generation_.fetch_add(1);
     control_epoch_.fetch_add(1);
     AbortRecording();
@@ -1517,8 +1567,8 @@ bool VoiceLabClient::StartAuthorizedRecording(const std::string& recording_id,
                                               uint32_t authorized_epoch, const cJSON* authorization,
                                               int64_t received_at_us, const cJSON* capture_plan) {
     std::lock_guard<std::mutex> operation(recording_mutex_);
-    if (binding_active_.load() || authorized_epoch != control_epoch_.load() || !IsConnected() || recording_.load() ||
-        tail_pending_.load())
+    if (binding_active_.load() || authorized_epoch != control_epoch_.load() || !IsConnected() ||
+        recording_.load() || tail_pending_.load())
         return false;
     if (!ApplyRecordingAuthorization(authorization, received_at_us))
         return false;

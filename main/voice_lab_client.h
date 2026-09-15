@@ -13,9 +13,9 @@
 #include <freertos/queue.h>
 
 #include "protocol.h"
+#include "voice_lab_pcm_buffer.h"
 #include "voice_lab_recording_guard.h"
 #include "voice_lab_recording_lease.h"
-#include "voice_lab_pcm_buffer.h"
 
 #include <web_socket.h>
 
@@ -128,6 +128,7 @@ private:
     std::unique_ptr<WebSocket> control_websocket_;
     std::unique_ptr<WebSocket> audio_websocket_;
     std::atomic<bool> connecting_{false};
+    std::atomic<int64_t> connection_wait_started_us_{0};
     std::atomic<bool> reconnect_scheduled_{false};
     std::atomic<bool> heartbeat_started_{false};
     std::atomic<bool> manual_disconnect_{false};

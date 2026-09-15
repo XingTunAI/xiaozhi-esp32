@@ -4,6 +4,7 @@
 enum class VoiceLabPrompt {
     WifiSetup,
     Connected,
+    ConnectionFailed,
     BindingCode,
     BindingDone,
     ResetConfirm,

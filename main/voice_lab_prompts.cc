@@ -28,6 +28,10 @@ bool SpeakVoiceLabPrompt(VoiceLabPrompt prompt) {
     auto& client = VoiceLabClient::GetInstance();
     if (client.IsRecording())
         return false;
+    if (prompt == VoiceLabPrompt::ConnectionFailed &&
+        (client.GetUserState() != VoiceLabClient::UserState::Error ||
+         client.IsFactoryResetActive()))
+        return false;
     if (prompt == VoiceLabPrompt::StartRequested &&
         client.GetUserState() != VoiceLabClient::UserState::Requesting)
         return false;
@@ -69,6 +73,9 @@ bool SpeakVoiceLabPrompt(VoiceLabPrompt prompt) {
         }
         case VoiceLabPrompt::Connected:
             sound = Lang::Sounds::OGG_VL_CONNECTED;
+            break;
+        case VoiceLabPrompt::ConnectionFailed:
+            sound = Lang::Sounds::OGG_VL_CONNECTION_FAILED;
             break;
         case VoiceLabPrompt::BindingCode: {
             const auto code = client.GetBindingCode();
