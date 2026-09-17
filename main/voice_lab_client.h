@@ -13,6 +13,7 @@
 #include <freertos/queue.h>
 
 #include "protocol.h"
+#include "voice_lab_media_policy.h"
 #include "voice_lab_pcm_buffer.h"
 #include "voice_lab_recording_guard.h"
 #include "voice_lab_recording_lease.h"
@@ -63,7 +64,7 @@ private:
     static constexpr int kAudioChannels = 1;
     static constexpr int kAudioFrameDurationMs = 20;
     static constexpr int kPcmSamplesPerFrame = kAudioSampleRate * kAudioFrameDurationMs / 1000;
-    static constexpr int kMaxFramesPerPacket = 1;
+    static constexpr int kMaxFramesPerPacket = VoiceLabMediaPolicy::kBatchFrames;
     // Bound retained audio by duration, independent of variable packet sizes.
     static constexpr uint64_t kMaxUnacknowledgedSamples = kAudioSampleRate * 4;
 #if CONFIG_SPIRAM
@@ -77,7 +78,8 @@ private:
     VoiceLabClient() = default;
     ~VoiceLabClient();
 
-    mutable std::mutex mutex_;
+    mutable std::mutex mutex_;  // Control socket only; never guards PCM/media I/O.
+    mutable std::mutex media_mutex_;
     mutable std::mutex binding_mutex_;
     std::atomic<bool> binding_active_{false};
     std::atomic<bool> customer_bound_{false};
@@ -119,6 +121,7 @@ private:
     uint32_t handled_control_epoch_ = 0;
     VoiceLabRecordingGuard recording_guard_;
     QueueHandle_t control_queue_ = nullptr;
+    QueueHandle_t session_queue_ = nullptr;
     esp_timer_handle_t safety_timer_ = nullptr;
     struct ControlMessage {
         cJSON* json;
@@ -143,7 +146,12 @@ private:
     uint64_t audio_frames_sent_ = 0;
     uint64_t audio_bytes_sent_ = 0;
     uint64_t last_audio_stats_us_ = 0;
+    int64_t next_media_reconnect_us_ = 0;
+    std::atomic<int64_t> last_ack_progress_us_{0};
+    std::string audio_url_;
+    std::string audio_token_;
     VoiceLabPcmBuffer pending_audio_pcm_;
+    int64_t pending_capture_start_us_ = 0;  // pcm_mutex_, timestamp of queued prefix.
     struct PendingPacket {
         std::string bytes;
         uint64_t sample_end;
@@ -174,6 +182,7 @@ private:
     void CloseAudioLocked();
     void EnsureHeartbeatTask();
     bool EnsureControlTask();
+    void PumpMedia();
     bool StartAuthorizedRecording(const std::string& recording_id, const std::string& mode,
                                   int revision, uint32_t authorized_epoch,
                                   const cJSON* authorization = nullptr, int64_t received_at_us = 0,
@@ -200,7 +209,7 @@ private:
     void NotifyRecordingStarted();
     bool FlushPendingAudioLocked();
     std::string BuildPcmPacket(const std::vector<int16_t>& pcm, uint64_t first_sequence,
-                               uint64_t first_sample_start) const;
+                               uint64_t first_sample_start, uint32_t captured_at_ms) const;
     void HandleJson(const cJSON* root);
     void HandleAudioJson(const cJSON* root);
 };

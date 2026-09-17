@@ -62,6 +62,21 @@ config VOICE_LAB_DEVICE_TOKEN
         Optional authorization token for Voice Lab device endpoints. Do not commit
         real secrets. It can be overridden at runtime with self.voice_lab.configure.
 
+config VOICE_LAB_DEVICE_KEY_PREFIX
+    string "Prefix for MAC-derived Voice Lab device identity"
+    default "waveshare-esp32s3-audio-"
+
+config VOICE_LAB_DEVICE_KEY_USE_BASE_MAC
+    bool "Derive Voice Lab identity from the host eFuse MAC"
+    default n
+    help
+        Use a stable host identity even when an external Wi-Fi coprocessor
+        has not started. Existing boards keep their Wi-Fi-derived identity.
+
+config VOICE_LAB_AUDIO_FRONTEND_FIRMWARE
+    string "Audio frontend firmware identity"
+    default "xiaozhi-es7210"
+
 config VOICE_LAB_HARDWARE_PROFILE
     string "Voice Lab hardware profile"
     default "waveshare-esp32s3-audio-board"
@@ -581,6 +596,9 @@ choice BOARD_TYPE
         depends on IDF_TARGET_ESP32P4
     config BOARD_TYPE_WAVESHARE_ESP32_P4_NANO
         bool "Waveshare ESP32-P4-Nano"
+        depends on IDF_TARGET_ESP32P4
+    config BOARD_TYPE_WAVESHARE_ESP32_P4_WIFI6_DEV_KIT_B
+        bool "Waveshare ESP32-P4-WIFI6-DEV-KIT-B (7-DSI-TOUCH-A)"
         depends on IDF_TARGET_ESP32P4
     config BOARD_TYPE_WAVESHARE_ESP32_S3_AUDIO_BOARD
         bool "Waveshare ESP32-S3 Audio Board"

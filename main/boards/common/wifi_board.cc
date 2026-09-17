@@ -355,6 +355,13 @@ void WifiBoard::EnterWifiConfigMode() {
 
 bool WifiBoard::IsInWifiConfigMode() const { return WifiManager::GetInstance().IsConfigMode(); }
 
+bool WifiBoard::IsNetworkConnected() const { return WifiManager::GetInstance().IsConnected(); }
+
+BoardNetworkStatus WifiBoard::GetBoardNetworkStatus() const {
+    auto& wifi = WifiManager::GetInstance();
+    return {wifi.GetIpAddress(), wifi.GetRssi(), wifi.GetChannel()};
+}
+
 NetworkInterface* WifiBoard::GetNetwork() {
     static EspNetwork network;
     return &network;

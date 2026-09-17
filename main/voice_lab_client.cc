@@ -13,6 +13,7 @@
 #include <esp_app_desc.h>
 #include <esp_heap_caps.h>
 #include <esp_log.h>
+#include <esp_mac.h>
 #include <esp_random.h>
 #include <esp_rom_sys.h>
 #include <esp_sntp.h>
@@ -81,7 +82,7 @@ namespace {
 constexpr const char* kControlSchemaVersion = "voice-lab-device-control-v1";
 constexpr const char* kAudioProtocol = "device-audio-v2";
 constexpr const char* kCapabilitySchemaVersion = "1";
-constexpr const char* kAudioFrontendFirmware = "xiaozhi-es7210";
+constexpr const char* kAudioFrontendFirmware = CONFIG_VOICE_LAB_AUDIO_FRONTEND_FIRMWARE;
 constexpr size_t kPcmPacketHeaderSize = 40;
 constexpr int kControlHeartbeatIntervalMs = 5000;
 constexpr int kEnrollmentHttpTimeoutMs = 10000;
@@ -112,8 +113,17 @@ std::string TrimTrailingSlash(std::string value) {
 }
 
 std::string DeriveDeviceKeyFromMac() {
+#if CONFIG_VOICE_LAB_DEVICE_KEY_USE_BASE_MAC
+    uint8_t address[6] = {};
+    ESP_ERROR_CHECK(esp_efuse_mac_get_default(address));
+    char formatted[13];
+    snprintf(formatted, sizeof(formatted), "%02x%02x%02x%02x%02x%02x", address[0], address[1],
+             address[2], address[3], address[4], address[5]);
+    std::string mac = formatted;
+#else
     std::string mac = SystemInfo::GetMacAddress();
-    std::string key = "waveshare-esp32s3-audio-";
+#endif
+    std::string key = CONFIG_VOICE_LAB_DEVICE_KEY_PREFIX;
     for (char ch : mac) {
         if (std::isxdigit(static_cast<unsigned char>(ch))) {
             key.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
@@ -357,7 +367,7 @@ bool VoiceLabClient::RestoreFactorySettings() {
     bool ok = !connecting_.load() && !binding_active_.load();
     const auto token = GetDeviceToken();
     if (ok && !token.empty()) {
-        ok = WifiManager::GetInstance().IsConnected() && EnsureSystemTimeForTls(IsTlsEnabled());
+        ok = Board::GetInstance().IsNetworkConnected() && EnsureSystemTimeForTls(IsTlsEnabled());
         if (ok) {
             int status = 0;
             auto* reply = BindingHttp("release", "", token, status);
@@ -369,7 +379,8 @@ bool VoiceLabClient::RestoreFactorySettings() {
     } else if (ok) {
         const auto proof = Settings("voice_lab", false).GetString("claim_proof");
         if (!proof.empty()) {
-            ok = WifiManager::GetInstance().IsConnected() && EnsureSystemTimeForTls(IsTlsEnabled());
+            ok =
+                Board::GetInstance().IsNetworkConnected() && EnsureSystemTimeForTls(IsTlsEnabled());
             if (ok) {
                 int status = 0;
                 auto* reply = BindingHttp("cancel", proof, "", status);
@@ -481,7 +492,7 @@ bool VoiceLabClient::EnrollIfNeeded() {
 cJSON* VoiceLabClient::BindingHttp(const char* action, const std::string& proof,
                                    const std::string& existing_token, int& status) {
     status = 0;
-    if (!IsTlsEnabled() || !WifiManager::GetInstance().IsConnected())
+    if (!IsTlsEnabled() || !Board::GetInstance().IsNetworkConnected())
         return nullptr;
     cJSON* body = cJSON_CreateObject();
     cJSON_AddStringToObject(body, "deviceKey", GetDeviceKey().c_str());
@@ -543,7 +554,7 @@ void VoiceLabClient::BeginCustomerBinding() {
         return;
     if (IsRecording() || customer_bound_.load() || GetUserState() == UserState::Requesting ||
         GetUserState() == UserState::Starting || GetUserState() == UserState::Stopping ||
-        !WifiManager::GetInstance().IsConnected())
+        !Board::GetInstance().IsNetworkConnected())
         return;
     if (!GetBindingCode().empty()) {
         QueueVoiceLabPrompt(VoiceLabPrompt::BindingCode);
@@ -632,7 +643,7 @@ bool VoiceLabClient::RunCustomerBinding(const std::string& existing_token) {
         QueueVoiceLabPrompt(VoiceLabPrompt::BindingCode);
     bool confirmed = false;
     while (esp_timer_get_time() < deadline && generation == connection_generation_.load() &&
-           !manual_disconnect_.load() && WifiManager::GetInstance().IsConnected()) {
+           !manual_disconnect_.load() && Board::GetInstance().IsNetworkConnected()) {
         vTaskDelay(pdMS_TO_TICKS(3000));
         reply = BindingHttp("poll", proof, "", status);
         state = cJSON_GetObjectItem(reply, "state");
@@ -646,7 +657,7 @@ bool VoiceLabClient::RunCustomerBinding(const std::string& existing_token) {
             continue;
         }
         if (generation != connection_generation_.load() || manual_disconnect_.load() ||
-            !WifiManager::GetInstance().IsConnected())
+            !Board::GetInstance().IsNetworkConnected())
             break;
         // Customer authorization has succeeded. Persist the candidate and a
         // receipt marker atomically before confirming credential delivery, so a
@@ -806,8 +817,10 @@ bool VoiceLabClient::ConnectControlLocked(const std::string& url, const std::str
     auto network = Board::GetInstance().GetNetwork();
     control_websocket_ = network->CreateWebSocket(3);
     // Assignment has disposed of the preceding socket and its callbacks.
-    latest_idle_revision_.store(-1);
-    active_revision_.store(-1);
+    if (!tail_pending_.load()) {
+        latest_idle_revision_.store(-1);
+        active_revision_.store(-1);
+    }
     if (control_websocket_ == nullptr) {
         ESP_LOGE(TAG, "Failed to create Voice Lab control websocket");
         connected_.store(false);
@@ -842,7 +855,8 @@ bool VoiceLabClient::ConnectControlLocked(const std::string& url, const std::str
         ESP_LOGI(TAG, "Voice Lab control disconnected");
         connected_.store(false);
         control_epoch_.fetch_add(1);
-        AbortRecording();
+        if (!recording_.load() && !tail_pending_.load())
+            AbortRecording();
         if (!manual_disconnect_.load()) {
             ScheduleReconnect();
         }
@@ -864,7 +878,8 @@ bool VoiceLabClient::ConnectControlLocked(const std::string& url, const std::str
         boot_id_ = (static_cast<uint64_t>(esp_random()) << 20) |
                    (static_cast<uint64_t>(esp_timer_get_time()) & 0xfffff);
     }
-    SetUserState(UserState::Ready);
+    if (!tail_pending_.load())
+        SetUserState(UserState::Ready);
     SendHelloLocked();
     return true;
 }
@@ -917,8 +932,8 @@ bool VoiceLabClient::ConnectAudioLocked(const std::string& url, const std::strin
     audio_websocket_->OnDisconnected([this]() {
         ESP_LOGI(TAG, "Voice Lab audio disconnected");
         audio_connected_.store(false);
-        if (!audio_completed_.load())
-            AbortRecording();
+        // The media worker reconnects and replays the bounded unacknowledged
+        // prefix. A disconnect alone must not discard already captured audio.
     });
 
     if (!audio_websocket_->Connect(url.c_str())) {
@@ -929,9 +944,6 @@ bool VoiceLabClient::ConnectAudioLocked(const std::string& url, const std::strin
         return false;
     }
 
-    audio_frames_sent_ = 0;
-    audio_bytes_sent_ = 0;
-    last_audio_stats_us_ = esp_timer_get_time();
     audio_connected_.store(true);
     return true;
 }
@@ -951,8 +963,11 @@ void VoiceLabClient::Disconnect() {
     control_epoch_.fetch_add(1);
     AbortRecording();
 
+    {
+        std::lock_guard<std::mutex> media(media_mutex_);
+        CloseAudioLocked();
+    }
     std::lock_guard<std::mutex> lock(mutex_);
-    CloseAudioLocked();
     if (control_websocket_ != nullptr) {
         control_websocket_->Close();
         control_websocket_.reset();
@@ -1022,7 +1037,8 @@ void VoiceLabClient::NotifyNetworkDisconnected() {
     connected_.store(false);
     connection_generation_.fetch_add(1);
     control_epoch_.fetch_add(1);
-    AbortRecording();
+    if (!recording_.load() && !tail_pending_.load())
+        AbortRecording();
 }
 
 bool VoiceLabClient::EnsureControlTask() {
@@ -1040,22 +1056,21 @@ bool VoiceLabClient::EnsureControlTask() {
         }));
 #endif
         control_queue_ = xQueueCreate(8, sizeof(ControlMessage));
-        if (!control_queue_)
+        session_queue_ = xQueueCreate(8, sizeof(ControlMessage));
+        if (!control_queue_ || !session_queue_)
             return false;
         if (xTaskCreate(
                 [](void* arg) {
                     auto* client = static_cast<VoiceLabClient*>(arg);
                     while (true) {
                         ControlMessage message{};
-                        // Send newly captured 20 ms frames on the next worker pass;
-                        // do not wait for a half-second batch or block the microphone.
-                        const auto wait_ms = client->recording_.load() ? 10 : 100;
-                        if (xQueueReceive(client->control_queue_, &message,
-                                          pdMS_TO_TICKS(wait_ms)) == pdTRUE) {
+                        if (xQueueReceive(client->session_queue_, &message, pdMS_TO_TICKS(50)) ==
+                            pdTRUE) {
                             auto* type = cJSON_GetObjectItem(message.json, "type");
                             if (message.epoch == client->control_epoch_.load()) {
                                 if (client->handled_control_epoch_ != message.epoch) {
-                                    client->recording_guard_.Reset();
+                                    if (!client->recording_.load() && !client->tail_pending_.load())
+                                        client->recording_guard_.Reset();
                                     client->handled_control_epoch_ = message.epoch;
                                 }
                                 if (strcmp(type->valuestring, "desired_config") == 0) {
@@ -1085,23 +1100,52 @@ bool VoiceLabClient::EnsureControlTask() {
                         }
                         if (client->tail_pending_.load() && !client->recording_.load()) {
                             client->StopRecording();
-                        } else if (client->recording_.load()) {
-                            client->MaybeRenewRecordingLease();
-                            std::lock_guard<std::mutex> lock(client->mutex_);
-                            for (int i = 0; i < 2 && client->recording_.load(); ++i) {
-                                if (!client->FlushPendingAudioLocked())
-                                    break;
-                            }
-                            if (!client->RetransmitAudioLocked())
-                                client->AbortRecording();
                         }
                     }
                 },
-                "voice_lab_control", 8192, this, 2, nullptr) != pdPASS) {
+                "voice_lab_session", 8192, this, 2, nullptr) != pdPASS) {
             vQueueDelete(control_queue_);
             control_queue_ = nullptr;
             return false;
         }
+        if (xTaskCreate(
+                [](void* arg) {
+                    auto* client = static_cast<VoiceLabClient*>(arg);
+                    while (true) {
+                        ControlMessage message{};
+                        if (xQueueReceive(client->control_queue_, &message, pdMS_TO_TICKS(50)) ==
+                            pdTRUE) {
+                            const auto* type = cJSON_GetObjectItem(message.json, "type");
+                            if (message.epoch != client->control_epoch_.load()) {
+                                cJSON_Delete(message.json);
+                            } else if (JsonText(type, "ping")) {
+                                cJSON_Delete(message.json);
+                                client->SendJson("{\"type\":\"pong\"}", message.epoch);
+                            } else if (JsonText(type, "recording_lease") ||
+                                       JsonText(type, "recording_request_result")) {
+                                client->HandleRecordingResponse(message.json);
+                                cJSON_Delete(message.json);
+                            } else if (xQueueSend(client->session_queue_, &message, 0) != pdTRUE) {
+                                cJSON_Delete(message.json);
+                                client->AbortRecording();
+                            }
+                        }
+                        if (client->recording_.load() && client->IsConnected())
+                            client->MaybeRenewRecordingLease();
+                    }
+                },
+                "voice_lab_control", 4096, this, 2, nullptr) != pdPASS)
+            return false;
+        if (xTaskCreate(
+                [](void* arg) {
+                    auto* client = static_cast<VoiceLabClient*>(arg);
+                    while (true) {
+                        client->PumpMedia();
+                        vTaskDelay(pdMS_TO_TICKS(10));
+                    }
+                },
+                "voice_lab_media", 8192, this, 2, nullptr) != pdPASS)
+            return false;
         esp_timer_create_args_t args{};
         args.callback = [](void* arg) {
             auto* client = static_cast<VoiceLabClient*>(arg);
@@ -1171,7 +1215,6 @@ void VoiceLabClient::EnsureHeartbeatTask() {
                     if (!client->SendJson("{\"type\":\"ping\"}")) {
                         ESP_LOGW(TAG, "Voice Lab heartbeat ping failed");
                         client->connected_.store(false);
-                        client->AbortRecording();
                         client->ScheduleReconnect();
                     }
                 } else {
@@ -1201,6 +1244,26 @@ void VoiceLabClient::EnsureUsbProvisioningTask() {
 
                 std::string command = TrimAsciiWhitespace(line);
                 if (command.empty()) {
+                    continue;
+                }
+                if (Board::GetInstance().HandleConsoleCommand(command)) {
+                    continue;
+                }
+                // Physical-console diagnostics affect only this device. The
+                // owning worker performs teardown; never destroy a live socket here.
+                if (command == "vl reconnect audio") {
+                    auto& client = VoiceLabClient::GetInstance();
+                    if (client.recording_.load()) {
+                        client.audio_connected_.store(false);
+                        ESP_LOGI(TAG, "Physical console requested media reconnect");
+                    }
+                    continue;
+                }
+                if (command == "vl reconnect control") {
+                    auto& client = VoiceLabClient::GetInstance();
+                    client.connected_.store(false);
+                    client.ConnectAsync();
+                    ESP_LOGI(TAG, "Physical console requested control reconnect");
                     continue;
                 }
 
@@ -1280,7 +1343,7 @@ void VoiceLabClient::SendHelloLocked() {
     auto device_key = GetDeviceKey();
     auto boot_id = std::to_string(boot_id_);
     std::string firmware_build = std::string(app_desc->date) + " " + app_desc->time;
-    auto& wifi = WifiManager::GetInstance();
+    const auto network_status = Board::GetInstance().GetBoardNetworkStatus();
 
     cJSON* root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "type", "hello");
@@ -1301,9 +1364,9 @@ void VoiceLabClient::SendHelloLocked() {
     cJSON_AddStringToObject(root, "capabilitySchemaVersion", kCapabilitySchemaVersion);
     cJSON_AddStringToObject(root, "audioFrontend", GetAudioFrontend().c_str());
     cJSON_AddStringToObject(root, "audioFrontendFirmware", kAudioFrontendFirmware);
-    cJSON_AddNumberToObject(root, "rssi", wifi.GetRssi());
-    cJSON_AddNumberToObject(root, "wifiChannel", wifi.GetChannel());
-    cJSON_AddStringToObject(root, "localIp", wifi.GetIpAddress().c_str());
+    cJSON_AddNumberToObject(root, "rssi", network_status.rssi);
+    cJSON_AddNumberToObject(root, "wifiChannel", network_status.channel);
+    cJSON_AddStringToObject(root, "localIp", network_status.ip.c_str());
     cJSON_AddStringToObject(root, "serverHost", GetConfiguredHost().c_str());
     cJSON_AddNumberToObject(root, "serverPort", GetConfiguredPort());
     cJSON_AddBoolToObject(root, "serverTls", IsTlsEnabled());
@@ -1363,7 +1426,7 @@ bool VoiceLabClient::SendJson(const std::string& json, uint32_t expected_epoch) 
 }
 
 bool VoiceLabClient::SendAudioJson(const std::string& json) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::mutex> lock(media_mutex_);
     if (audio_websocket_ == nullptr || !audio_websocket_->IsConnected()) {
         return false;
     }
@@ -1480,7 +1543,7 @@ bool VoiceLabClient::ApplyRecordingAuthorization(const cJSON* authorization,
 }
 
 uint64_t VoiceLabClient::CaptureSampleEnd() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::mutex> lock(media_mutex_);
     std::lock_guard<std::mutex> pcm_lock(pcm_mutex_);
     return sample_start_ + pending_audio_pcm_.size() / kAudioChannels;
 }
@@ -1576,8 +1639,6 @@ bool VoiceLabClient::StartAuthorizedRecording(const std::string& recording_id,
     // stop held recording_mutex_ across a disconnect/reconnect.
     const auto epoch = authorized_epoch;
     recording_control_epoch_ = epoch;
-    recording_id_ = recording_id;
-    recording_revision_ = revision;
     capture_generation_.fetch_add(1);
     active_revision_.store(revision);
     SetUserState(UserState::Starting);
@@ -1590,11 +1651,13 @@ bool VoiceLabClient::StartAuthorizedRecording(const std::string& recording_id,
     capture_stop_failed_.store(false);
     start_request_deadline_us_.store(0);
     {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<std::mutex> lock(media_mutex_);
         CloseAudioLocked();
     }
     // Previous stream close callbacks have now finished. A new abort during
     // preparation must survive every following wait and state reset.
+    recording_id_ = recording_id;
+    recording_revision_ = revision;
     const auto abort_generation = abort_generation_.load();
     auto cancelled = [this, epoch, revision, abort_generation]() {
         const auto lease_deadline = lease_deadline_us_.load();
@@ -1619,14 +1682,18 @@ bool VoiceLabClient::StartAuthorizedRecording(const std::string& recording_id,
     auto audio_url = BuildWebsocketUrl("/api/v1/devices/" + device_key + "/audio");
 
     {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<std::mutex> lock(media_mutex_);
         if (cancelled()) {
             SetUserState(UserState::Error);
             return false;
         }
         audio_accepted_.store(false);
         audio_completed_.store(false);
-        if (!ConnectAudioLocked(audio_url, token)) {
+        audio_url_ = audio_url;
+        audio_token_ = token;
+        next_media_reconnect_us_ = 0;
+        last_ack_progress_us_.store(esp_timer_get_time());
+        if (!ConnectAudioLocked(audio_url_, audio_token_)) {
             SetUserState(UserState::Error);
             return false;
         }
@@ -1663,7 +1730,7 @@ bool VoiceLabClient::StartAuthorizedRecording(const std::string& recording_id,
         vTaskDelay(pdMS_TO_TICKS(20));
     }
     if (!audio_accepted_.load() || !audio_connected_.load() || cancelled()) {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<std::mutex> lock(media_mutex_);
         CloseAudioLocked();
         SetUserState(UserState::Error);
         return false;
@@ -1672,7 +1739,7 @@ bool VoiceLabClient::StartAuthorizedRecording(const std::string& recording_id,
     audio_service.EnableWakeWordDetection(false);
 #if CONFIG_VOICE_LAB_STANDALONE_MODE
     if (!SpeakVoiceLabPrompt(VoiceLabPrompt::RecordingStarted)) {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<std::mutex> lock(media_mutex_);
         CloseAudioLocked();
         SetUserState(UserState::Error);
         return false;
@@ -1680,7 +1747,7 @@ bool VoiceLabClient::StartAuthorizedRecording(const std::string& recording_id,
     vTaskDelay(pdMS_TO_TICKS(150));  // Let the speaker tail settle before capture.
 #endif
     if (!audio_connected_.load() || cancelled()) {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<std::mutex> lock(media_mutex_);
         CloseAudioLocked();
         SetUserState(UserState::Error);
         return false;
@@ -1701,7 +1768,7 @@ bool VoiceLabClient::StartAuthorizedRecording(const std::string& recording_id,
         }
     }
     if (!opened) {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<std::mutex> lock(media_mutex_);
         CloseAudioLocked();
         SetUserState(UserState::Error);
         return false;
@@ -1769,12 +1836,13 @@ bool VoiceLabClient::StopRecording() {
     const uint64_t cutoff = capture_sample_end;
     bool tail_sent = false;
     {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<std::mutex> lock(media_mutex_);
         tail_sent = audio_websocket_ != nullptr && audio_websocket_->IsConnected();
     }
-    for (int i = 0; tail_sent && i < kMaxPendingPcmFrames; ++i) {
+    const auto tail_deadline = esp_timer_get_time() + kAudioDrainTimeoutMs * 1000LL;
+    while (tail_sent && esp_timer_get_time() < tail_deadline) {
         {
-            std::lock_guard<std::mutex> lock(mutex_);
+            std::lock_guard<std::mutex> lock(media_mutex_);
             {
                 std::lock_guard<std::mutex> pcm_lock(pcm_mutex_);
                 if (pending_audio_pcm_.empty())
@@ -1790,13 +1858,20 @@ bool VoiceLabClient::StopRecording() {
         // and CPU so heartbeats and server ingestion can progress during stop.
         vTaskDelay(pdMS_TO_TICKS(10));
     }
+    {
+        std::lock_guard<std::mutex> pcm_lock(pcm_mutex_);
+        if (!pending_audio_pcm_.empty()) {
+            interrupted_.store(true);
+            tail_sent = false;
+        }
+    }
     // Give the cutoff packet a bounded retry opportunity before `end`. The
     // existing server drains and closes after `end`, so never send PCM after it.
     const auto ack_deadline = esp_timer_get_time() + 2000000;
     while (tail_sent && audio_connected_.load() && acknowledged_sample_end_.load() < cutoff &&
            esp_timer_get_time() < ack_deadline) {
         {
-            std::lock_guard<std::mutex> lock(mutex_);
+            std::lock_guard<std::mutex> lock(media_mutex_);
             if (!RetransmitAudioLocked()) {
                 interrupted_.store(true);
                 break;
@@ -1805,7 +1880,7 @@ bool VoiceLabClient::StopRecording() {
         vTaskDelay(pdMS_TO_TICKS(20));
     }
     {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<std::mutex> lock(media_mutex_);
         if (tail_sent && audio_websocket_ && audio_websocket_->IsConnected()) {
             end_sent = audio_websocket_->Send("{\"type\":\"end\"}");
         }
@@ -1818,7 +1893,7 @@ bool VoiceLabClient::StopRecording() {
     const bool complete = capture_stopped && end_sent && audio_completed_.load() &&
                           acknowledged_sample_end_.load() >= cutoff && !interrupted_.load();
     {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<std::mutex> lock(media_mutex_);
         CloseAudioLocked();
         {
             std::lock_guard<std::mutex> pcm_lock(pcm_mutex_);
@@ -1900,12 +1975,6 @@ bool VoiceLabClient::SendPcmAudio(std::vector<int16_t>&& pcm) {
     }
 
     std::lock_guard<std::mutex> lock(pcm_mutex_);
-    if (!audio_connected_.load()) {
-        audio_connected_.store(false);
-        AbortRecording();
-        return false;
-    }
-
     if (!recording_.load()) {
         return false;
     }
@@ -1915,15 +1984,69 @@ bool VoiceLabClient::SendPcmAudio(std::vector<int16_t>&& pcm) {
         AbortRecording();
         return false;
     }
+    if (pending_audio_pcm_.empty())
+        pending_capture_start_us_ =
+            esp_timer_get_time() - static_cast<int64_t>(pcm.size()) * 1000000 / kAudioSampleRate;
     if (!pending_audio_pcm_.Push(pcm.data(), pcm.size())) {
         AbortRecording();
         return false;
     }
     first_pcm_received_.store(true);
-    // The control worker sends available frames without waiting to fill a batch.
-    // Never perform socket I/O in the
-    // microphone task, including when a server stops acknowledging audio.
+    // The independent media worker batches the fixed queue. Capture never
+    // waits for network writes or ACKs.
     return true;
+}
+
+void VoiceLabClient::PumpMedia() {
+    if (!recording_.load())
+        return;
+    std::lock_guard<std::mutex> media(media_mutex_);
+    if (!recording_.load() || !Board::GetInstance().IsNetworkConnected())
+        return;
+    const auto now = esp_timer_get_time();
+    while (!unacknowledged_audio_.empty() &&
+           unacknowledged_audio_.front().sample_end <= acknowledged_sample_end_.load())
+        unacknowledged_audio_.pop_front();
+    const bool stalled =
+        !unacknowledged_audio_.empty() && now - last_ack_progress_us_.load() >= 4000000;
+    if (!audio_connected_.load() || stalled) {
+        if (now < next_media_reconnect_us_)
+            return;
+        ESP_LOGW(TAG, "Media reconnect: reason=%s ack=%llu sent=%llu; retaining bounded PCM",
+                 stalled ? "ack_timeout" : "disconnected",
+                 static_cast<unsigned long long>(acknowledged_sample_end_.load()),
+                 static_cast<unsigned long long>(sent_sample_end_.load()));
+        audio_connected_.store(false);
+        audio_accepted_.store(false);
+        // Dispose locally, without a blocking graceful close on a broken link.
+        audio_websocket_.reset();
+        next_media_reconnect_us_ = esp_timer_get_time() + 1000000;
+        if (!recording_.load() || !ConnectAudioLocked(audio_url_, audio_token_))
+            return;
+        for (auto& packet : unacknowledged_audio_) {
+            packet.last_sent_us = 0;
+            packet.retries = 0;
+        }
+        last_ack_progress_us_.store(esp_timer_get_time());
+        return;
+    }
+    if (!audio_accepted_.load()) {
+        if (now - last_ack_progress_us_.load() >= kAudioAcceptTimeoutMs * 1000LL)
+            audio_connected_.store(false);
+        return;
+    }
+    // Replay in original order and with original IDs before sending new PCM.
+    // ACK can commit the prefix during Send; only this worker mutates the deque.
+    for (auto& packet : unacknowledged_audio_) {
+        if (packet.last_sent_us != 0 || packet.sample_end <= acknowledged_sample_end_.load())
+            continue;
+        packet.last_sent_us = now;
+        if (!audio_websocket_->Send(packet.bytes.data(), packet.bytes.size(), true))
+            audio_connected_.store(false);
+        return;
+    }
+    if (!FlushPendingAudioLocked())
+        audio_connected_.store(false);
 }
 
 bool VoiceLabClient::FlushPendingAudioLocked() {
@@ -1932,11 +2055,6 @@ bool VoiceLabClient::FlushPendingAudioLocked() {
         return true;
     }
     const size_t pending_frames = pending_audio_pcm_.size() / kPcmSamplesPerFrame;
-    const size_t frames_to_send =
-        std::min(pending_frames, static_cast<size_t>(kMaxFramesPerPacket));
-    if (frames_to_send == 0) {
-        return true;
-    }
     if (audio_websocket_ == nullptr || !audio_websocket_->IsConnected()) {
         audio_connected_.store(false);
         return false;
@@ -1945,14 +2063,13 @@ bool VoiceLabClient::FlushPendingAudioLocked() {
            unacknowledged_audio_.front().sample_end <= acknowledged_sample_end_.load()) {
         unacknowledged_audio_.pop_front();
     }
-    const size_t samples_to_send = frames_to_send * kPcmSamplesPerFrame;
     const auto acknowledged = acknowledged_sample_end_.load();
     const auto outstanding = sample_start_ > acknowledged ? sample_start_ - acknowledged : 0;
-    if (outstanding + samples_to_send > kMaxUnacknowledgedSamples) {
-        ESP_LOGW(TAG, "Voice Lab acknowledgement buffer full; stopping capture");
-        AbortRecording();
-        return false;
-    }
+    const size_t frames_to_send =
+        VoiceLabMediaPolicy::BatchFrames(pending_frames, outstanding, !recording_.load());
+    if (!frames_to_send)
+        return true;
+    const size_t samples_to_send = frames_to_send * kPcmSamplesPerFrame;
 
     std::vector<int16_t> batch(samples_to_send);
     if (!pending_audio_pcm_.Pop(batch.data(), samples_to_send)) {
@@ -1960,8 +2077,12 @@ bool VoiceLabClient::FlushPendingAudioLocked() {
         return false;
     }
     const size_t remaining_frames = pending_audio_pcm_.size() / kPcmSamplesPerFrame;
+    const uint32_t captured_at_ms = static_cast<uint32_t>(pending_capture_start_us_ / 1000);
+    pending_capture_start_us_ += frames_to_send * kAudioFrameDurationMs * 1000;
     pcm_lock.unlock();
-    auto packet = BuildPcmPacket(batch, audio_sequence_, sample_start_);
+    auto packet = BuildPcmPacket(batch, audio_sequence_, sample_start_, captured_at_ms);
+    if (unacknowledged_audio_.empty())
+        last_ack_progress_us_.store(esp_timer_get_time());
     unacknowledged_audio_.push_back(
         {packet, sample_start_ + samples_to_send, esp_timer_get_time(), 0});
     sent_sample_end_.store(sample_start_ + samples_to_send);
@@ -1993,7 +2114,7 @@ bool VoiceLabClient::FlushPendingAudioLocked() {
     if (!sent) {
         ESP_LOGW(TAG, "Failed to send Voice Lab PCM batch: frames=%u samples=%u",
                  static_cast<unsigned>(frames_to_send), static_cast<unsigned>(samples_to_send));
-        AbortRecording();
+        audio_connected_.store(false);
         return false;
     }
 
@@ -2052,7 +2173,8 @@ bool VoiceLabClient::RetransmitAudioLocked() {
 }
 
 std::string VoiceLabClient::BuildPcmPacket(const std::vector<int16_t>& pcm, uint64_t first_sequence,
-                                           uint64_t first_sample_start) const {
+                                           uint64_t first_sample_start,
+                                           uint32_t captured_at_ms) const {
     const uint32_t samples_per_channel = static_cast<uint32_t>(pcm.size());
     const uint8_t frame_count = static_cast<uint8_t>(samples_per_channel / kPcmSamplesPerFrame);
 
@@ -2066,7 +2188,7 @@ std::string VoiceLabClient::BuildPcmPacket(const std::vector<int16_t>& pcm, uint
     AppendLe64(packet, boot_id_);
     AppendLe64(packet, first_sequence);
     AppendLe64(packet, first_sample_start);
-    AppendLe32(packet, static_cast<uint32_t>(esp_timer_get_time() / 1000));
+    AppendLe32(packet, captured_at_ms);
     AppendLe32(packet, samples_per_channel);
 
     for (int16_t sample : pcm) {
@@ -2152,6 +2274,8 @@ void VoiceLabClient::ApplyDesiredConfig(const cJSON* root, uint32_t authorized_e
             } else {
                 compatible = compatible && active_session_id_.empty();
             }
+            if (compatible)
+                recording_control_epoch_ = authorized_epoch;
         }
         SendConfigAck(authorized_epoch, revision, applied_mode, capture_plan, compatible,
                       compatible ? "" : "revision_conflict");
@@ -2263,6 +2387,8 @@ void VoiceLabClient::HandleAudioJson(const cJSON* root) {
         auto previous = acknowledged_sample_end_.load();
         while (end > previous && !acknowledged_sample_end_.compare_exchange_weak(previous, end)) {
         }
+        if (end > previous)
+            last_ack_progress_us_.store(esp_timer_get_time());
         auto dropped = cJSON_GetObjectItem(root, "serverQueueDroppedFrames");
         if (cJSON_IsNumber(dropped) && dropped->valuedouble > 0) {
             ESP_LOGW(TAG, "Server dropped audio; marking this test interrupted");

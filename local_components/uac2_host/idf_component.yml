@@ -1,0 +1,6 @@
+version: "0.1.2"
+description: "UAC2 Host P4 integration from Averyy/esp-uac2-host"
+dependencies:
+  idf: ">=6.0"
+targets:
+  - esp32p4

@@ -140,6 +140,19 @@ dependencies:
     rules:
     - if: target in [esp32s3, esp32p4]
 
+  espressif/usb_host_uac:
+    version: '1.5.0'
+    rules:
+      - if: target in [esp32p4]
+  uac2_host:
+    path: ../local_components/uac2_host
+    rules:
+      - if: target in [esp32p4]
+  espressif/ip101:
+    version: '1.0.0'
+    rules:
+    - if: target in [esp32p4]
+
   espressif/bq27220:
     public: true
     version: '*'

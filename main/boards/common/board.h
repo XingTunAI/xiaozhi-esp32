@@ -43,6 +43,12 @@ enum class PowerSaveLevel {
 // data contains additional info like SSID for Connecting/Connected events
 using NetworkEventCallback = std::function<void(NetworkEvent event, const std::string& data)>;
 
+struct BoardNetworkStatus {
+    std::string ip;
+    int rssi = 0;
+    int channel = 0;
+};
+
 void* create_board();
 class AudioCodec;
 class Display;
@@ -74,6 +80,10 @@ public:
     virtual Display* GetDisplay();
     virtual Camera* GetCamera();
     virtual NetworkInterface* GetNetwork() = 0;
+    virtual bool IsNetworkConnected() const { return false; }
+    virtual BoardNetworkStatus GetBoardNetworkStatus() const { return {}; }
+    // Optional physical-console maintenance command, implemented by the board.
+    virtual bool HandleConsoleCommand(const std::string&) { return false; }
     virtual void StartNetwork() = 0;
     virtual void SetNetworkEventCallback(NetworkEventCallback callback) { (void)callback; }
     virtual const char* GetNetworkStateIcon() = 0;

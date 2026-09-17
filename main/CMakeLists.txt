@@ -501,6 +501,11 @@ elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_AMOLED_1_32)
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_20_4)
     set(BUILTIN_ICON_FONT font_material_symbols_20_4)
     set(DEFAULT_EMOJI_COLLECTION noto-color-emoji_32)
+elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_P4_WIFI6_DEV_KIT_B)
+    set(BOARD_DIR "waveshare/esp32-p4-wifi6-dev-kit-b")
+    set(BUILTIN_TEXT_FONT font_noto_sans_basic_30_4)
+    set(BUILTIN_ICON_FONT font_material_symbols_30_4)
+    set(DEFAULT_EMOJI_COLLECTION noto-color-emoji_64)
 elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_P4_NANO)
     set(BOARD_DIR "waveshare/esp32-p4-nano")
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_30_4)
@@ -1071,6 +1076,7 @@ idf_component_register(SRCS ${SOURCES}
                         esp_psram
                         esp_netif
                         esp_eth
+                        esp_http_client
                         esp_driver_gpio
                         esp_driver_uart
                         esp_driver_spi
@@ -1335,6 +1341,10 @@ function(get_assets_local_file assets_source assets_local_file_var)
     set(${assets_local_file_var} ${ASSETS_LOCAL_FILE} PARENT_SCOPE)
 endfunction()
 
+
+if(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_P4_WIFI6_DEV_KIT_B)
+    include("${CMAKE_CURRENT_LIST_DIR}/boards/waveshare/esp32-p4-wifi6-dev-kit-b/uac_cleanup_fix.cmake")
+endif()
 
 partition_table_get_partition_info(size "--partition-name assets" "size")
 partition_table_get_partition_info(offset "--partition-name assets" "offset")

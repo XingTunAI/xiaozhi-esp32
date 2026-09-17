@@ -37,6 +37,8 @@ public:
     virtual void OutputData(std::vector<int16_t>& data);
     virtual bool InputData(std::vector<int16_t>& data);
     virtual void Start();
+    // Called by the input task before the first read of a new external session.
+    virtual void ResetInputCapture() {}
 
     inline bool duplex() const { return duplex_; }
     inline bool input_reference() const { return input_reference_; }

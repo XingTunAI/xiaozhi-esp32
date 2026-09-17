@@ -244,6 +244,7 @@ void AudioService::AudioInputTask() {
     uint32_t external_capture_read_fail = 0;
     uint32_t external_capture_callback_missing = 0;
     int64_t last_external_capture_stats_us = 0;
+    uint64_t input_capture_generation = 0;
 
     while (true) {
         EventBits_t bits = xEventGroupWaitBits(event_group_, kAudioInputActiveBits |
@@ -314,6 +315,10 @@ void AudioService::AudioInputTask() {
                 external_capture_in_flight_ = true;
             }
 
+            if (input_capture_generation != capture_generation) {
+                codec_->ResetInputCapture();
+                input_capture_generation = capture_generation;
+            }
             std::vector<int16_t> data;
             int samples = EXTERNAL_CAPTURE_FRAME_DURATION_MS * 16000 / 1000;
             bool read_ok = ReadAudioData(data, 16000, samples);
@@ -821,6 +826,8 @@ void AudioService::EnableExternalCapture(bool enable) {
     } else {
         external_capture_enabled_ = false;
         xEventGroupClearBits(event_group_, AS_EVENT_EXTERNAL_CAPTURE_RUNNING);
+        // The input task owns hardware stop; wake it even with no active consumer.
+        xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_INPUT_STOP_REQUEST);
     }
 }
 
@@ -828,6 +835,7 @@ bool AudioService::StopExternalCaptureAndWait(uint32_t timeout_ms) {
     std::unique_lock<std::mutex> lock(external_capture_mutex_);
     external_capture_enabled_ = false;
     xEventGroupClearBits(event_group_, AS_EVENT_EXTERNAL_CAPTURE_RUNNING);
+    xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_INPUT_STOP_REQUEST);
     const uint64_t generation = external_capture_generation_;
 
     if (xTaskGetCurrentTaskHandle() == audio_input_task_handle_) {
