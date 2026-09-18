@@ -9,6 +9,16 @@ struct VoiceLabMediaPolicy {
     static constexpr size_t kBatchFrames = 25;
     static constexpr uint64_t kWindowSamples = 16000 * 4;
 
+    static constexpr bool CanPump(bool draining, bool recording, bool tail_pending,
+                                  bool interrupted) {
+        return draining ? tail_pending && !interrupted : recording;
+    }
+
+    static constexpr bool TailConfirmed(size_t pending_samples, bool connected, bool accepted,
+                                        uint64_t acknowledged, uint64_t cutoff) {
+        return pending_samples == 0 && connected && accepted && acknowledged >= cutoff;
+    }
+
     static constexpr size_t BatchFrames(size_t pending_frames, uint64_t outstanding,
                                         bool draining) {
         if (outstanding >= kWindowSamples || (!draining && pending_frames < kBatchFrames))

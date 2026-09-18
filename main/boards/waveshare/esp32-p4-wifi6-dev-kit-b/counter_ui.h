@@ -7,6 +7,13 @@ public:
     void Show(lv_obj_t* parent);
     // Physical-console smoke test uses the same event as a touch, under LVGL lock.
     bool PressRecordingButton();
+    void ShowAccountPage() { Render(7); }
+    bool PressBindingButton() {
+        if (!binding_button_)
+            return false;
+        lv_obj_send_event(binding_button_, LV_EVENT_CLICKED, nullptr);
+        return true;
+    }
     void SetDiagnosticFreeze(bool freeze) { diagnostic_freeze_ = freeze; }
 
 private:
@@ -27,6 +34,7 @@ private:
     int page_ = 0;
     lv_timer_t* settings_timer_ = nullptr;
     lv_obj_t* settings_status_ = nullptr;
+    lv_obj_t* binding_button_ = nullptr;
     lv_obj_t* settings_hint_ = nullptr;
     lv_obj_t* ssid_ = nullptr;
     lv_obj_t* password_ = nullptr;

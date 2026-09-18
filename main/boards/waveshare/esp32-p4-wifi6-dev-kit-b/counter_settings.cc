@@ -57,6 +57,7 @@ void CounterUi::RenderSettings(int page) {
     Button(root_, 32, 118, 210, "网络配置", this, 4, SettingsAction);
     Button(root_, 32, 190, 210, "版本信息", this, 5, SettingsAction);
     Button(root_, 32, 262, 210, "存储与音频", this, 6, SettingsAction);
+    Button(root_, 32, 334, 210, "账号与绑定", this, 7, SettingsAction);
     Label(root_, 36, 656, 1170, "本机设置 · 网络配置保存到设备；演示计价与录音状态保持不变",
           0x94A49B);
     if (page == 4) {
@@ -138,6 +139,26 @@ void CounterUi::RenderSettings(int page) {
         scan_revision_ = static_cast<unsigned>(-1);
     } else if (page == 5) {
         settings_status_ = Label(root_, 284, 104, 948, "正在读取版本信息");
+    } else if (page == 7) {
+        settings_status_ = Label(root_, 284, 104, 948, "正在读取绑定状态");
+        auto* qr = lv_qrcode_create(root_);
+        lv_qrcode_set_size(qr, 260);
+        lv_qrcode_set_dark_color(qr, lv_color_black());
+        lv_qrcode_set_light_color(qr, lv_color_white());
+        lv_qrcode_set_quiet_zone(qr, true);
+        lv_obj_set_pos(qr, 300, 206);
+        constexpr char url[] = "https://voice-lab.cloud/tingjian/guide";
+        if (lv_qrcode_update(qr, url, strlen(url)) != LV_RESULT_OK)
+            lv_obj_add_flag(qr, LV_OBJ_FLAG_HIDDEN);
+        Label(root_, 610, 218, 610,
+              "手机扫码打开听见快速开始\n登录账号后，输入本屏八位绑定码。\n账号和录音记录在手机端管"
+              "理。",
+              WHITE);
+        binding_button_ =
+            Button(root_, 610, 360, 340, "检查绑定 / 获取绑定码", this, 103, SettingsAction);
+        settings_hint_ = Label(
+            root_, 284, 500, 948,
+            "入口：voice-lab.cloud/tingjian/guide\n二维码仅打开网页，不包含账号密码。", 0x94A49B);
     } else {
         settings_status_ = Label(root_, 284, 104, 948, "正在读取外设状态");
         Button(root_, 284, 470, 300, "检测 SD 卡", this, 102, SettingsAction);
@@ -159,6 +180,21 @@ void CounterUi::RenderSettings(int page) {
 void CounterUi::UpdateSettings() {
     if (page_ < 4 || !settings_status_)
         return;
+    if (page_ == 7) {
+        auto& client = VoiceLabClient::GetInstance();
+        const auto code = client.GetBindingCode();
+        std::string text = client.IsConnected() ? "服务：已连接" : "服务：未连接";
+        if (client.IsCustomerBound())
+            text += "\n账号：已确认绑定，请在听见网页查看所属账号";
+        else if (!code.empty())
+            text += "\n八位绑定码：" + code + "（有效期内使用）";
+        else if (client.IsBindingActive())
+            text += "\n正在向服务端确认绑定状态，请稍候";
+        else
+            text += "\n绑定状态待确认；点击下方按钮检查或获取绑定码";
+        SetText(settings_status_, text);
+        return;
+    }
     const auto state = GetBoardPeripheralStatus();
     if (page_ == 4) {
         SetText(settings_status_, "有线网络：" + state.ethernet + "    IP：" + state.ethernet_ip +
@@ -223,6 +259,20 @@ void CounterUi::SettingsAction(lv_event_t* event) {
                                            lv_textarea_get_text(self->password_));
         if (accepted)
             lv_textarea_set_text(self->password_, "");
+    } else if (action == 103) {
+        auto& client = VoiceLabClient::GetInstance();
+        if (client.IsRecording() || client.GetUserState() == VoiceLabClient::UserState::Stopping) {
+            SetText(self->settings_hint_, "请先停止录音并等待保存完成，再进行绑定操作。");
+            return;
+        }
+        if (!IsBoardNetworkConnected()) {
+            SetText(self->settings_hint_, "请先在网络配置中连接网络。");
+            return;
+        }
+        client.BeginCustomerBinding(false);
+        SetText(self->settings_hint_,
+                "请查看上方状态；绑定码过期后可再次获取。\n更换账号请先在听见网页解绑设备。");
+        return;
     } else if (action == 102)
         accepted = RequestBoardStorageCheck();
     SetText(self->settings_hint_, accepted ? "请求已提交，请等待状态更新。"

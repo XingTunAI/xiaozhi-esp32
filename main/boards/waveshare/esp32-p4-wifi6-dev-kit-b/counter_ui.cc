@@ -35,9 +35,13 @@ void CounterUi::Show(lv_obj_t* parent) {
 }
 
 void CounterUi::Render(int page) {
+    // Customer view is a single page; settings keep their existing page IDs.
+    if (page < 4)
+        page = 0;
     page_ = page;
     recording_button_ = recording_label_ = recording_status_ = nullptr;
     settings_status_ = settings_hint_ = ssid_ = password_ = networks_ = keyboard_ = nullptr;
+    binding_button_ = nullptr;
     lv_obj_clean(root_);
     if (page >= 4) {
         RenderSettings(page);
@@ -73,6 +77,19 @@ void CounterUi::Render(int page) {
             lv_obj_set_style_text_align(label, item.align, 0);
         }
     }
+    // Staff can long-press the brand area without adding a customer-facing button.
+    auto* maintenance = lv_obj_create(root_);
+    lv_obj_remove_style_all(maintenance);
+    lv_obj_set_pos(maintenance, 32, 16);
+    lv_obj_set_size(maintenance, 640, 64);
+    lv_obj_remove_flag(maintenance, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(maintenance, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(
+        maintenance,
+        [](lv_event_t* event) {
+            static_cast<CounterUi*>(lv_event_get_user_data(event))->Render(4);
+        },
+        LV_EVENT_LONG_PRESSED, this);
     RenderRecordingControls();
 }
 
@@ -89,6 +106,10 @@ void CounterUi::RenderRecordingControls() {
     lv_obj_set_width(recording_status_, 900);
     lv_obj_set_style_text_font(recording_status_, &counter_font_20, 0);
     lv_obj_set_style_text_color(recording_status_, lv_color_hex(0xF2F0E8), 0);
+    if (page_ == 0) {
+        UpdateRecordingControls();
+        return;
+    }
     recording_button_ = lv_button_create(bar);
     lv_obj_set_pos(recording_button_, 966, 6);
     lv_obj_set_size(recording_button_, 238, 52);
@@ -147,7 +168,7 @@ void CounterUi::UpdateRecordingControls() {
     if (observed_recording_ && !recording)
         recording_completed_ = true;
     observed_recording_ = recording;
-    if (!recording_button_)
+    if (!recording_status_)
         return;
     const char* action = "开始录音";
     const char* hint = recording_completed_ ? "录音已完成" : "服务已连接 · 等待录音";
@@ -176,6 +197,14 @@ void CounterUi::UpdateRecordingControls() {
     }
     if (recording_action_pending_.load())
         enabled = false;
+    if (page_ == 0) {
+        // Show actual recording activity, but keep technical recovery advice in settings.
+        if (!recording && state != State::Stopping)
+            hint = recording_completed_ ? "录音已完成" : "录音未开启";
+        if (strcmp(lv_label_get_text(recording_status_), hint) != 0)
+            lv_label_set_text(recording_status_, hint);
+        return;
+    }
     if (enabled)
         lv_obj_remove_state(recording_button_, LV_STATE_DISABLED);
     else

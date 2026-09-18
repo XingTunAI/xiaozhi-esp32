@@ -1344,6 +1344,15 @@ endfunction()
 
 if(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_P4_WIFI6_DEV_KIT_B)
     include("${CMAKE_CURRENT_LIST_DIR}/boards/waveshare/esp32-p4-wifi6-dev-kit-b/uac_cleanup_fix.cmake")
+    # LVGL and esp_emote_gfx both bundle qrcodegen. Namespace LVGL's copy
+    # for this board so both libraries can coexist without vendor edits.
+    idf_component_get_property(p4_lvgl_lib lvgl__lvgl COMPONENT_LIB)
+    foreach(qr_fn encodeText encodeBinary encodeSegments encodeSegmentsAdvanced
+            isAlphanumeric isNumeric calcSegmentBufferSize makeBytes makeNumeric
+            makeAlphanumeric makeEci getSize getModule version2size getMinFitVersion)
+        target_compile_definitions(${p4_lvgl_lib} PRIVATE
+            "qrcodegen_${qr_fn}=p4_lvgl_qrcodegen_${qr_fn}")
+    endforeach()
 endif()
 
 partition_table_get_partition_info(size "--partition-name assets" "size")

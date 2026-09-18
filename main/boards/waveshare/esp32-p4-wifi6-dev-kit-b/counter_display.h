@@ -32,6 +32,14 @@ public:
         DisplayLockGuard guard(this);
         return ui_.PressRecordingButton();
     }
+    void ShowAccountPage() {
+        DisplayLockGuard guard(this);
+        ui_.ShowAccountPage();
+    }
+    bool PressBindingButton() {
+        DisplayLockGuard guard(this);
+        return ui_.PressBindingButton();
+    }
     void SetDiagnosticFreeze(bool freeze) {
         DisplayLockGuard guard(this);
         ui_.SetDiagnosticFreeze(freeze);

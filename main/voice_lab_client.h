@@ -43,7 +43,9 @@ public:
     bool IsRecording() const { return recording_.load(); }
 
     bool PairWithEnrollmentCode(const std::string& enrollment_code);
-    void BeginCustomerBinding();
+    void BeginCustomerBinding(bool announce = true);
+    bool IsCustomerBound() const { return customer_bound_.load(); }
+    bool IsBindingActive() const { return binding_active_.load(); }
     std::string GetBindingCode() const;
     void ClearPairing();
     void ResetVoiceLabSettings();
@@ -82,6 +84,7 @@ private:
     mutable std::mutex media_mutex_;
     mutable std::mutex binding_mutex_;
     std::atomic<bool> binding_active_{false};
+    bool binding_announce_ = true;  // Written before spawning the single binding worker.
     std::atomic<bool> customer_bound_{false};
     std::atomic<bool> factory_reset_active_{false};
     std::string binding_code_;
@@ -173,7 +176,7 @@ private:
     std::string BuildHttpUrl(const std::string& path) const;
     std::string BuildWebsocketUrl(const std::string& path) const;
     bool EnrollIfNeeded();
-    bool RunCustomerBinding(const std::string& existing_token);
+    bool RunCustomerBinding(const std::string& existing_token, bool announce = true);
     bool ConfirmPendingBinding();
     cJSON* BindingHttp(const char* action, const std::string& proof,
                        const std::string& existing_token, int& status);
@@ -183,6 +186,7 @@ private:
     void EnsureHeartbeatTask();
     bool EnsureControlTask();
     void PumpMedia();
+    void PumpMediaLocked(bool draining);
     bool StartAuthorizedRecording(const std::string& recording_id, const std::string& mode,
                                   int revision, uint32_t authorized_epoch,
                                   const cJSON* authorization = nullptr, int64_t received_at_us = 0,

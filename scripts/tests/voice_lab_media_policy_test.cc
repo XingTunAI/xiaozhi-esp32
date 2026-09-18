@@ -1,5 +1,14 @@
 #include "voice_lab_media_policy.h"
 using P = VoiceLabMediaPolicy;
+static_assert(P::CanPump(true, false, true, false), "stopping capture retains media recovery");
+static_assert(!P::CanPump(false, false, true, false), "background worker yields to stop owner");
+static_assert(!P::CanPump(true, false, true, true), "abort must not resume media");
+static_assert(!P::CanPump(true, false, false, false), "finished session must not reconnect");
+static_assert(!P::TailConfirmed(320, true, true, 8000, 8000), "queued PCM must drain");
+static_assert(!P::TailConfirmed(0, true, true, 7680, 8000), "socket success is not final ACK");
+static_assert(!P::TailConfirmed(0, false, true, 8000, 8000), "end requires a live transport");
+static_assert(!P::TailConfirmed(0, true, false, 8000, 8000), "reconnect must be accepted");
+static_assert(P::TailConfirmed(0, true, true, 8000, 8000), "cutoff ACK permits end");
 static_assert(P::BatchFrames(24, 0, false) == 0, "do not send per-frame packets");
 static_assert(P::BatchFrames(25, 0, false) == 25, "500 ms batch");
 static_assert(P::BatchFrames(600, 0, false) == 25, "bounded recovery packet");

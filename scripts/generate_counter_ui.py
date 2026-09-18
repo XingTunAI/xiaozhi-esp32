@@ -30,21 +30,14 @@ def button(x, y, w, h, value, action, fill=GOLD, ink=INK, size=24):
     return dict(**box(x, y, w, h, fill, 12), text=value, size=size, ink=ink, action=action)
 
 
-def common(active):
-    nodes = [box(32, 31, 8, 32, GOLD, 3), text(56, 22, 420, "星豚 · 智慧柜台", 28),
-             text(879, 30, 170, "柜台 01", 20, MUTED, "right"),
-             button(1084, 25, 164, 44, "设备设置", 4, 0x29352D, GOLD, 20),
-             box(32, 137, 1216, 1, LINE, 0), box(32, 654, 1216, 1, LINE, 0),
-             box(34, 684, 8, 8, MUTED, 4), text(53, 669, 215, "录音未开启", 18, MUTED),
-             text(300, 669, 720, "演示模式 · 未连接电子秤和交易系统", 18, MUTED),
-             text(1020, 669, 228, "透明计价  安心选购", 18, GOLD, "right")]
-    for index, title in enumerate(["金价与计价", "订单预览", "服务说明"]):
-        x = 32 + index * 200
-        nodes.append(button(x, 87, 178, 48, title, index, BG,
-                            GOLD if index == active else MUTED, 24))
-        if index == active:
-            nodes.append(box(x + 25, 135, 128, 3, GOLD, 1))
-    return nodes
+def common():
+    return [box(32, 31, 8, 32, GOLD, 3),
+            text(56, 22, 600, "星豚 · 智慧柜台", 28),
+            text(1020, 30, 228, "柜台 01", 20, MUTED, "right"),
+            text(56, 91, 1000, "透明计价  安心选购", 20, MUTED),
+            box(32, 137, 1216, 1, LINE, 0),
+            box(32, 654, 1216, 1, LINE, 0),
+            text(44, 676, 700, "录音未开启", 20, MUTED)]
 
 
 def pages():
@@ -53,7 +46,7 @@ def pages():
     labor = (12680 * 3500 + 500) // 1000
     money = lambda cents: f"¥{cents // 100:,}.{cents % 100:02d}"
     total = money(material + labor)
-    home = common(0) + [
+    home = common() + [
         box(32, 158, 640, 402), text(60, 180, 310, "今日金价", 28),
         text(490, 188, 154, "演示报价", 18, GOLD, "right"),
         text(60, 243, 300, "足金 999", 24, GOLD),
@@ -68,7 +61,7 @@ def pages():
         box(696, 158, 552, 477), text(724, 180, 285, "本次计价", 28),
         text(1060, 187, 160, "示例商品", 18, MUTED, "right"),
         text(724, 235, 480, "足金素圈手镯", 24),
-        text(724, 294, 260, "商品克重（手动）", 18, MUTED),
+        text(724, 294, 260, "商品克重", 18, MUTED),
         text(984, 283, 236, "12.680 g", 28, WHITE, "right"),
         text(724, 340, 270, "金料金额", 20, MUTED),
         text(984, 336, 236, money(material), 24, WHITE, "right"),
@@ -76,42 +69,9 @@ def pages():
         text(984, 381, 236, money(labor), 24, WHITE, "right"),
         box(724, 437, 496, 1, LINE, 0), text(724, 454, 240, "预计合计", 18, MUTED),
         text(719, 478, 510, total, 44, GOLD),
-        button(724, 558, 496, 58, "核对明细", 1),
+        text(724, 566, 496, "示例计价 · 以门店实际报价为准", 20, MUTED),
     ]
-    order = common(1) + [
-        box(32, 158, 778, 477), text(64, 181, 650, "请核对本次商品与费用", 28),
-        text(64, 235, 650, "订单演示  /  仅供界面体验", 18, MUTED),
-        box(64, 288, 714, 1, LINE, 0),
-        text(64, 311, 370, "商品", 20, MUTED), text(414, 305, 364, "足金素圈手镯", 24, WHITE, "right"),
-        text(64, 369, 370, "克重（手动输入）", 20, MUTED), text(414, 363, 364, "12.680 g", 24, WHITE, "right"),
-        text(64, 427, 370, "金料金额", 20, MUTED), text(414, 421, 364, money(material), 24, WHITE, "right"),
-        text(64, 485, 370, "工费", 20, MUTED), text(414, 479, 364, money(labor), 24, WHITE, "right"),
-        text(64, 571, 700, "没有连接收银系统，不会创建订单或扣款。", 18, MUTED),
-        box(832, 158, 416, 477), text(862, 186, 356, "预计合计", 24, MUTED),
-        text(857, 263, 378, total, 44, GOLD), text(862, 357, 356, "明细清楚，再安心确认。", 20),
-        button(862, 462, 356, 66, "确认（演示）", 3),
-        button(862, 548, 356, 58, "返回计价", 0, 0x29352D, WHITE, 22),
-    ]
-    info = common(2) + [
-        text(40, 175, 1100, "看得见的价格，听得见的服务。", 32),
-        text(40, 235, 1100, "柜台客显原型 · 当前所有内容均为离线演示", 20, MUTED),
-        box(32, 303, 389, 234), box(444, 303, 389, 234), box(856, 303, 392, 234),
-        text(60, 325, 340, "01  价格透明", 24, GOLD),
-        text(60, 390, 334, "金价、克重与工费分项展示。\n本机未接入实时行情，\n示例报价不可用于成交。", 20),
-        text(472, 325, 340, "02  记录明示", 24, GOLD),
-        text(472, 390, 334, "当前录音未开启。\n正式服务开启记录前，\n应清楚告知顾客用途。", 20),
-        text(884, 325, 338, "03  双方核对", 24, GOLD),
-        text(884, 390, 334, "确认之前，逐项核对明细。\n当前确认仅演示交互，\n不会下单，也不会扣款。", 20),
-        button(462, 565, 356, 62, "返回金价与计价", 0),
-    ]
-    done = common(1) + [
-        box(220, 170, 840, 454), text(260, 211, 760, "明细已确认", 44, GOLD, "center"),
-        text(260, 290, 760, "演示操作完成", 24, WHITE, "center"),
-        text(260, 352, 760, "本次未创建订单、未扣款，也未开启录音。", 20, MUTED, "center"),
-        text(260, 405, 760, "感谢核对，每一项费用都清楚。", 24, WHITE, "center"),
-        button(462, 520, 356, 64, "返回首页", 0),
-    ]
-    return [home, order, info, done]
+    return [home]
 
 
 def get_font(path, size):

@@ -2,15 +2,15 @@
 
 目标为 PCB Rev1.2、P4 revision 3.1、16MB Flash / 32MB PSRAM，以及配套的 7-DSI-TOUCH-A（ILI9881C，720×1280）。此板型与一体式 P4 Touch LCD 7 不同，不可互刷。
 
-唯一变体 `esp32-p4x-wifi6-dev-kit-b-screen` 复用小智应用和 MipiLcdDisplay，实现横屏 1280×720 原生 LVGL 柜台演示。包含金价与计价、订单预览、服务说明、确认结果四页，所有价格均为演示数据，不创建订单、不支付。ES8311 探测成功后复用小智音频驱动，缺失则回退 DummyAudioCodec 保留界面；不自动录音。GT9xx 触摸自动探测 0x5d/0x14。当前 StartNetwork 会把有线/Wi-Fi 的 IP 可用状态交给现有 Voice Lab 客户端，使用独立设备标识和 HTTPS/WSS 配对；不启动小智 OTA。USB UAC2 阵列提供采集，板载 ES8311 保留提示音播放。最新接入状态见 [WEBSOCKET-INTEGRATION.md](WEBSOCKET-INTEGRATION.md)。
+唯一变体 `esp32-p4x-wifi6-dev-kit-b-screen` 复用小智应用和 MipiLcdDisplay，实现横屏 1280×720 原生 LVGL 柜台演示。客户首页为单页信息展示，保留金价、商品克重、费用明细和合计；无导航、订单确认或录音操作按钮。所有价格均为演示数据，不创建订单、不支付。ES8311 探测成功后复用小智音频驱动，缺失则回退 DummyAudioCodec 保留界面；不自动录音。GT9xx 触摸自动探测 0x5d/0x14。当前 StartNetwork 会把有线/Wi-Fi 的 IP 可用状态交给现有 Voice Lab 客户端，使用独立设备标识和 HTTPS/WSS 配对；不启动小智 OTA。USB UAC2 阵列提供采集，板载 ES8311 保留提示音播放。最新接入状态见 [WEBSOCKET-INTEGRATION.md](WEBSOCKET-INTEGRATION.md)。
 
 显示参数与初始化表参考 `waveshare/esp32_p4_platform 2.0.1` 和 `waveshare/esp_lcd_ili9881c 2.0.0`。初始化表保留 Apache-2.0 标记；通过项目已有的乐鑫 ILI9881C 驱动发送。复位/背光使用 I2C1（SDA7/SCL8）上屏幕控制器 0x45 的 0x95/0x96 寄存器，不使用一体屏的 GPIO26/27。DSI 双 lane、1000 Mbps、80 MHz DPI、RGB565。当前继承 MipiLcdDisplay 的局部刷新、软件旋转与单帧缓冲，未开启防撕裂；需真机验证，不能直接将双缓冲开关等同于横屏刷新同步完成。
 
-底部新增录音按钮和状态栏，使用既有服务端授权与音频收尾流程。按钮操作在独立任务执行，避免阻塞 LVGL；需服务端为设备开通自助录音，不能用管理员 mock 测试代替授权。最近录音回放尚未接入。当前板级 DSI 使用同步 CPU 拷贝，动态界面联合负载中曾出现发送积压和 USB 路径崩溃，仍需长稳验收，详细证据见 Voice Lab 根目录交接记录。
+客户首页底部仅显示真实录音状态。录音按钮位于维护页，使用既有服务端授权与音频收尾流程。按钮操作在独立任务执行，避免阻塞 LVGL；需服务端为设备开通自助录音，不能用管理员 mock 测试代替授权。最近录音回放尚未接入。当前板级 DSI 使用同步 CPU 拷贝，动态界面联合负载中曾出现发送积压和 USB 路径崩溃，仍需长稳验收，详细证据见 Voice Lab 根目录交接记录。
 
 中文字体为 OFL 授权 Noto Sans SC 的 4bpp 子集，许可见 FONT-LICENSE.txt。静态布局、字库和预览由 `scripts/generate_counter_ui.py` 生成；动态录音栏由 `counter_ui.cc` 渲染，静态预览不覆盖其运行状态，也不代表实机截图。
 
-首页右上角“设备设置”包含网络配置、版本信息、存储与音频。网络页显示实际有线/Wi-Fi状态，支持扫描及触屏输入密码，连接成功后保存；有线DHCP优先。版本页区分主机驱动与C6实际查询结果。SD卡当前未插入，以后插卡后点击检测，不自动格式化。完整驱动与验收边界见 [HARDWARE-VALIDATION.md](HARDWARE-VALIDATION.md)。
+长按首页左上角“星豚 · 智慧柜台”标题区域进入设备维护页，包含网络配置、版本信息、存储与音频；点击“返回首页”回到客户展示。网络页显示实际有线/Wi-Fi状态，支持扫描及触屏输入密码，连接成功后保存；有线DHCP优先。版本页区分主机驱动与C6实际查询结果。SD卡当前未插入，以后插卡后点击检测，不自动格式化。完整驱动与验收边界见 [HARDWARE-VALIDATION.md](HARDWARE-VALIDATION.md)。
 
 构建入口（优先 ESP-IDF 6.0.2）：
 
@@ -40,3 +40,19 @@ python scripts/build.py waveshare/esp32-p4-wifi6-dev-kit-b --name esp32-p4x-wifi
 - 用户确认屏幕有 TP，并要求相对首版倒置。LVGL 旋转从 90° 调整为 270°；输入处理使用 LVGL 自带 lv_display_rotate_point，同步转换原始触摸坐标，避免二次旋转。
 - 本机日志：flash-xiaozhi-ui.log、boot-xiaozhi-ui.log；位于 C:/QIU/p4-screen-20260916/。显示方向、点击准确度、撕裂与长稳以现场观察为准。
 - 倒置版已构建并仅更新 0x20000 应用段，写入哈希通过。应用 SHA-256：32a097420cbdac3947225dafc2b829fdfe277fdeee7a674164136fc7d0a810b9。日志：flash-xiaozhi-ui-rotated.log、boot-xiaozhi-ui-rotated.log。
+
+## 账号与二维码页面
+
+设备设置新增“账号与绑定”。二维码复用微雪交付指南入口 `https://voice-lab.cloud/tingjian/guide`；手机登录及八位绑定码确认仍沿用现有流程。二维码不携带密码、设备长期凭据或一次性证明。点击“检查绑定 / 获取绑定码”调用现有客户端绑定流程，并关闭本次绑定的语音提示；未新增按钮音。录音中禁止绑定操作。
+
+页面显示服务连接、待确认/绑定中/服务端已确认绑定，以及有效期内的八位码。当前协议没有提供账号展示名、额度等快照，页面不硬编码 test 账号，具体账号信息在手机端查看。更换账号先在听见网页解绑。新增物理串口诊断 `p4 account-page` 和 `p4 binding-button`，用于打开页面和触发同一按钮事件。
+
+LVGL 与 esp_emote_gfx 都包含 qrcodegen，P4 构建对 LVGL 的符号加独立前缀，避免重复定义，不修改第三方源码。
+
+## 2026-09-18 客户演示首页
+
+客户首页不提供可见按钮，移除订单预览、服务说明和确认结果页面。价格均为示例；未连接实时行情或交易系统。维护入口为长按标题，属于界面收纳而非权限控制。录音操作保留在维护页，客户页只展示实际录音状态，不自动开启录音。静态预览中的“录音未开启”为初始状态，运行时由客户端更新。
+
+## SDIO 诊断构建（2026-09-18）
+
+`config.sdio-diagnostic.json` 保持当前硬件板型与UI，使用独立构建名称 `esp32-p4x-wifi6-dev-kit-b-screen-sdio-diagnostic`，启用乐鑫官方主机包统计，每5秒输出一次。用上述构建命令加 `--config config.sdio-diagnostic.json`，并将 `--name` 改为此诊断构建名称。首次5分钟录音正常结束，未发现主机侧流控拒绝或SDIO发送丢弃；仍有一次738ms TLS慢写，不代表根因已解决。完整证据见工作区 `docs/2026-09-18-p4-sdio-driver-investigation.md`。

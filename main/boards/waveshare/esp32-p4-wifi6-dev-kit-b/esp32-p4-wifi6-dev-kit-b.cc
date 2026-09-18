@@ -3,6 +3,7 @@
 #include "board_peripherals.h"
 #include "config.h"
 #include "counter_display.h"
+#include "voice_lab_client.h"
 #include "display/lcd_display.h"
 #include "lcd_init_cmds.h"
 #include "usb_capture_codec.h"
@@ -103,6 +104,17 @@ public:
             }
             return true;
         }
+        if (command == "p4 account-page") {
+            static_cast<CounterDisplay*>(display_)->ShowAccountPage();
+            ESP_LOGI(TAG, "Account page opened");
+            return true;
+        }
+        if (command == "p4 binding-button") {
+            ESP_LOGI(TAG, "Binding button event: %s",
+                     static_cast<CounterDisplay*>(display_)->PressBindingButton() ? "sent"
+                                                                                  : "page closed");
+            return true;
+        }
         if (command == "p4 record-button") {
             ESP_LOGI(TAG, "Recording button event: %s",
                      static_cast<CounterDisplay*>(display_)->PressRecordingButton() ? "sent"
@@ -110,6 +122,9 @@ public:
             return true;
         }
         if (command == "p4 status") {
+            ESP_LOGI(TAG, "Binding diagnostics: confirmed=%d active=%d",
+                     VoiceLabClient::GetInstance().IsCustomerBound(),
+                     VoiceLabClient::GetInstance().IsBindingActive());
             const auto state = GetBoardPeripheralStatus();
             ESP_LOGI(TAG, "Network diagnostics: reset_reason=%d eth_ip=%s wifi_ip=%s c6=%s",
                      static_cast<int>(esp_reset_reason()), state.ethernet_ip.c_str(),

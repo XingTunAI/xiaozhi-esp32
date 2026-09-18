@@ -546,7 +546,7 @@ std::string VoiceLabClient::GetBindingCode() const {
     return esp_timer_get_time() < binding_code_deadline_us_ ? binding_code_ : "";
 }
 
-void VoiceLabClient::BeginCustomerBinding() {
+void VoiceLabClient::BeginCustomerBinding(bool announce) {
     if (factory_reset_active_.load())
         return;
     std::unique_lock<std::mutex> operation(recording_mutex_, std::try_to_lock);
@@ -557,16 +557,19 @@ void VoiceLabClient::BeginCustomerBinding() {
         !Board::GetInstance().IsNetworkConnected())
         return;
     if (!GetBindingCode().empty()) {
-        QueueVoiceLabPrompt(VoiceLabPrompt::BindingCode);
+        if (announce)
+            QueueVoiceLabPrompt(VoiceLabPrompt::BindingCode);
         return;
     }
     bool expected = false;
     if (!binding_active_.compare_exchange_strong(expected, true))
         return;
+    binding_announce_ = announce;
     if (xTaskCreate(
             [](void* arg) {
                 auto* client = static_cast<VoiceLabClient*>(arg);
-                const bool ok = client->RunCustomerBinding(client->GetDeviceToken());
+                const bool ok =
+                    client->RunCustomerBinding(client->GetDeviceToken(), client->binding_announce_);
                 client->binding_active_.store(false);
                 if (ok && !client->IsConnected())
                     client->ConnectAsync();
@@ -580,7 +583,7 @@ void VoiceLabClient::BeginCustomerBinding() {
     }
 }
 
-bool VoiceLabClient::RunCustomerBinding(const std::string& existing_token) {
+bool VoiceLabClient::RunCustomerBinding(const std::string& existing_token, bool announce) {
     if (!EnsureSystemTimeForTls(IsTlsEnabled()))
         return false;
     const auto generation = connection_generation_.load();
@@ -639,7 +642,7 @@ bool VoiceLabClient::RunCustomerBinding(const std::string& existing_token) {
     }
     cJSON_Delete(reply);
     SetUserState(UserState::Connecting);
-    if (!resume_claimed)
+    if (!resume_claimed && announce)
         QueueVoiceLabPrompt(VoiceLabPrompt::BindingCode);
     bool confirmed = false;
     while (esp_timer_get_time() < deadline && generation == connection_generation_.load() &&
@@ -687,7 +690,8 @@ bool VoiceLabClient::RunCustomerBinding(const std::string& existing_token) {
         }
         if (confirmed) {
             customer_bound_.store(true);
-            QueueVoiceLabPrompt(VoiceLabPrompt::BindingDone);
+            if (announce)
+                QueueVoiceLabPrompt(VoiceLabPrompt::BindingDone);
             break;
         }
     }
@@ -1835,53 +1839,30 @@ bool VoiceLabClient::StopRecording() {
     bool end_sent = false;
     const uint64_t cutoff = capture_sample_end;
     bool tail_sent = false;
-    {
-        std::lock_guard<std::mutex> lock(media_mutex_);
-        tail_sent = audio_websocket_ != nullptr && audio_websocket_->IsConnected();
-    }
     const auto tail_deadline = esp_timer_get_time() + kAudioDrainTimeoutMs * 1000LL;
-    while (tail_sent && esp_timer_get_time() < tail_deadline) {
+    // Stop capture immediately, but retain the same media recovery path until
+    // the captured cutoff is acknowledged. A transient disconnect is retryable.
+    while (!interrupted_.load() && esp_timer_get_time() < tail_deadline) {
         {
             std::lock_guard<std::mutex> lock(media_mutex_);
+            PumpMediaLocked(true);
             {
                 std::lock_guard<std::mutex> pcm_lock(pcm_mutex_);
-                if (pending_audio_pcm_.empty())
+                if (VoiceLabMediaPolicy::TailConfirmed(
+                        pending_audio_pcm_.size(), audio_connected_.load(), audio_accepted_.load(),
+                        acknowledged_sample_end_.load(), cutoff)) {
+                    tail_sent = true;
                     break;
-            }
-            if (!FlushPendingAudioLocked()) {
-                interrupted_.store(true);
-                tail_sent = false;
-                break;
+                }
             }
         }
-        // Drain at up to twice capture speed, yielding both the transport lock
-        // and CPU so heartbeats and server ingestion can progress during stop.
+        // Yield the transport lock and CPU between bounded recovery batches.
         vTaskDelay(pdMS_TO_TICKS(10));
     }
     {
-        std::lock_guard<std::mutex> pcm_lock(pcm_mutex_);
-        if (!pending_audio_pcm_.empty()) {
-            interrupted_.store(true);
-            tail_sent = false;
-        }
-    }
-    // Give the cutoff packet a bounded retry opportunity before `end`. The
-    // existing server drains and closes after `end`, so never send PCM after it.
-    const auto ack_deadline = esp_timer_get_time() + 2000000;
-    while (tail_sent && audio_connected_.load() && acknowledged_sample_end_.load() < cutoff &&
-           esp_timer_get_time() < ack_deadline) {
-        {
-            std::lock_guard<std::mutex> lock(media_mutex_);
-            if (!RetransmitAudioLocked()) {
-                interrupted_.store(true);
-                break;
-            }
-        }
-        vTaskDelay(pdMS_TO_TICKS(20));
-    }
-    {
         std::lock_guard<std::mutex> lock(media_mutex_);
-        if (tail_sent && audio_websocket_ && audio_websocket_->IsConnected()) {
+        if (tail_sent && !interrupted_.load() && audio_websocket_ &&
+            audio_websocket_->IsConnected()) {
             end_sent = audio_websocket_->Send("{\"type\":\"end\"}");
         }
     }
@@ -2001,7 +1982,13 @@ void VoiceLabClient::PumpMedia() {
     if (!recording_.load())
         return;
     std::lock_guard<std::mutex> media(media_mutex_);
-    if (!recording_.load() || !Board::GetInstance().IsNetworkConnected())
+    PumpMediaLocked(false);
+}
+
+void VoiceLabClient::PumpMediaLocked(bool draining) {
+    if (!VoiceLabMediaPolicy::CanPump(draining, recording_.load(), tail_pending_.load(),
+                                      interrupted_.load()) ||
+        !Board::GetInstance().IsNetworkConnected())
         return;
     const auto now = esp_timer_get_time();
     while (!unacknowledged_audio_.empty() &&
@@ -2021,7 +2008,8 @@ void VoiceLabClient::PumpMedia() {
         // Dispose locally, without a blocking graceful close on a broken link.
         audio_websocket_.reset();
         next_media_reconnect_us_ = esp_timer_get_time() + 1000000;
-        if (!recording_.load() || !ConnectAudioLocked(audio_url_, audio_token_))
+        if ((draining ? interrupted_.load() : !recording_.load()) ||
+            !ConnectAudioLocked(audio_url_, audio_token_))
             return;
         for (auto& packet : unacknowledged_audio_) {
             packet.last_sent_us = 0;
@@ -2045,7 +2033,7 @@ void VoiceLabClient::PumpMedia() {
             audio_connected_.store(false);
         return;
     }
-    if (!FlushPendingAudioLocked())
+    if (!FlushPendingAudioLocked() || (draining && !RetransmitAudioLocked()))
         audio_connected_.store(false);
 }
 
