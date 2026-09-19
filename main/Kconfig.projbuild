@@ -1239,3 +1239,10 @@ menu "TAIJIPAI_S3_CONFIG"
 endmenu
 
 endmenu
+config ESP_VIDEO_USE_CUSTOMIZED_ESP_H264_VERSION
+    bool "Use customized H264 dependency (legacy compatibility)"
+    default n
+    help
+        Compatibility default for video dependency manifests evaluated by the
+        ESP-IDF 6.1 component resolver. The selected esp_video 2.4.1 no longer
+        defines this legacy option; do not select a customized H264 dependency.

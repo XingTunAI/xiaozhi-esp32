@@ -29,3 +29,14 @@ constexpr bool AckReleasesWindow() {
     return next == 25 && sent - ack == P::kWindowSamples;
 }
 static_assert(AckReleasesWindow(), "ACK releases capacity without dropping queued capture");
+static_assert(P::OutstandingSamples(8000, 4000, 0) == 4000, "ordinary ACK accounting unchanged");
+static_assert(P::OutstandingSamples(960000, 8000, 960000) == 0,
+              "offline interval must not fill the new live window");
+static_assert(P::OutstandingSamples(968000, 8000, 960000) == 8000,
+              "first resumed packet still consumes ACK capacity");
+static_assert(P::OutstandingSamples(976000, 968000, 960000) == 8000,
+              "real resumed ACK advances the window");
+static_assert(P::BatchFrames(25, P::OutstandingSamples(1024000, 8000, 960000), false) == 0,
+              "resuming must retain the bounded four-second window");
+static_assert(!P::TailConfirmed(0, true, true, 8000, 960000),
+              "a new live window is not a fabricated ACK for the offline interval");

@@ -3,10 +3,10 @@
 #include "board_peripherals.h"
 #include "config.h"
 #include "counter_display.h"
-#include "voice_lab_client.h"
 #include "display/lcd_display.h"
 #include "lcd_init_cmds.h"
 #include "usb_capture_codec.h"
+#include "voice_lab_client.h"
 #include "wifi_board.h"
 
 #include <driver/i2c_master.h>
@@ -84,6 +84,10 @@ public:
         });
     }
 
+    std::string GetRecordingStoragePath() const override {
+        const auto status = GetBoardPeripheralStatus();
+        return status.storage.find("已挂载") == 0 ? "/sdcard" : "";
+    }
     bool IsNetworkConnected() const override { return IsBoardNetworkConnected(); }
 
     bool HandleConsoleCommand(const std::string& command) override {

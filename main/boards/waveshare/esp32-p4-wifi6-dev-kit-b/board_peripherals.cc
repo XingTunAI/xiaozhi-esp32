@@ -630,7 +630,7 @@ esp_err_t StartSdCard() {
     slot.d3 = GPIO_NUM_42;
     esp_vfs_fat_sdmmc_mount_config_t mount = {};
     mount.format_if_mount_failed = false;
-    mount.max_files = 3;
+    mount.max_files = 8;  // Independent writer, uploader and directory/manifest operations.
     mount.allocation_unit_size = 16 * 1024;
     sdmmc_card_t* card = nullptr;
     err = esp_vfs_fat_sdmmc_mount("/sdcard", &host, &slot, &mount, &card);
@@ -668,7 +668,9 @@ void Initialize(void*) {
         std::lock_guard<std::mutex> lock(status_mutex);
         status.usb = err == ESP_OK ? "已就绪" : "初始化失败";
     }
-    // No card is fitted at present. Storage is probed only on explicit request.
+    // Optional, never formats a card. Discover pending archives after reboot.
+    err = StartSdCard();
+    ESP_LOGI(TAG, "Recording storage initialization: %s", esp_err_to_name(err));
     err = InitializeWifi();
     if (err == ESP_OK) {
         CheckWifiRadio();

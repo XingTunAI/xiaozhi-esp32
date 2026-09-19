@@ -13,6 +13,7 @@
 #include <freertos/queue.h>
 
 #include "protocol.h"
+#include "voice_lab_archive.h"
 #include "voice_lab_media_policy.h"
 #include "voice_lab_pcm_buffer.h"
 #include "voice_lab_recording_guard.h"
@@ -41,6 +42,9 @@ public:
     void NotifyNetworkDisconnected();
     bool IsConnected() const;
     bool IsRecording() const { return recording_.load(); }
+    bool IsLocallyRecording() const { return recording_.load() && archive_recording_.load(); }
+    bool HasLocalPendingAudio() const { return archive_.ManualRecovery(); }
+    bool HasRealtimeAudioGap() const { return archive_realtime_gap_.load(); }
 
     bool PairWithEnrollmentCode(const std::string& enrollment_code);
     void BeginCustomerBinding(bool announce = true);
@@ -77,6 +81,14 @@ private:
     static constexpr int kMaxPendingPcmFrames = 1000 / kAudioFrameDurationMs;
 #endif
 
+    bool InitializeArchive();
+    VoiceLabArchive archive_;
+    std::atomic<bool> archive_recording_{false}, archive_live_suspended_{false};
+    std::atomic<bool> archive_realtime_mode_{false};
+    std::atomic<bool> archive_realtime_gap_{false};
+    uint64_t archive_sample_start_ = 0;
+    uint64_t archive_captured_samples_ = 0;  // pcm_mutex_; includes queued disk frames.
+    uint64_t realtime_window_start_ = 0;     // media_mutex_; never an ingress ACK.
     VoiceLabClient() = default;
     ~VoiceLabClient();
 

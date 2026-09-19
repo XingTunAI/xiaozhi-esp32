@@ -178,7 +178,10 @@ void CounterUi::UpdateRecordingControls() {
         const auto seconds = (esp_timer_get_time() - recording_started_us_) / 1000000;
         snprintf(elapsed, sizeof(elapsed), "正在录音  %02lld:%02lld%s",
                  static_cast<long long>(seconds / 60), static_cast<long long>(seconds % 60),
-                 client.IsConnected() ? "" : " · 服务连接中");
+                 client.IsLocallyRecording() ? (!client.IsConnected()          ? " · 离线录音中"
+                                                : client.HasRealtimeAudioGap() ? " · 转写有缺口"
+                                                                               : " · TF 卡保存中")
+                                             : (client.IsConnected() ? "" : " · 服务连接中"));
         action = "停止录音";
         hint = elapsed;
     } else if (state == State::Stopping) {
@@ -195,12 +198,23 @@ void CounterUi::UpdateRecordingControls() {
     } else if (state == State::Error || recording_action_failed_.load()) {
         hint = "录音未完成，请检查服务端授权或网络";
     }
+    if (!recording && state != State::Error && state != State::Stopping &&
+        !recording_action_failed_.load()) {
+        if (client.HasLocalPendingAudio())
+            hint = "本次录音有异常 · 音频待补传";
+        else if (client.HasRealtimeAudioGap())
+            hint = "本次录音已保存 · 转写不完整";
+    }
     if (recording_action_pending_.load())
         enabled = false;
     if (page_ == 0) {
         // Show actual recording activity, but keep technical recovery advice in settings.
-        if (!recording && state != State::Stopping)
-            hint = recording_completed_ ? "录音已完成" : "录音未开启";
+        if (!recording && state != State::Stopping && state != State::Error &&
+            !recording_action_failed_.load())
+            hint = client.HasLocalPendingAudio()  ? "本次录音有异常 · 音频待补传"
+                   : client.HasRealtimeAudioGap() ? "本次录音已保存 · 转写不完整"
+                   : recording_completed_         ? "录音已完成"
+                                                  : "录音未开启";
         if (strcmp(lv_label_get_text(recording_status_), hint) != 0)
             lv_label_set_text(recording_status_, hint);
         return;

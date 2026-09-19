@@ -837,6 +837,10 @@ bool VoiceLabClient::ConnectControlLocked(const std::string& url, const std::str
     control_websocket_->SetHeader("Device-Id", SystemInfo::GetMacAddress().c_str());
     control_websocket_->SetHeader("Client-Id", Board::GetInstance().GetUuid().c_str());
     control_websocket_->SetHeader("Voice-Lab-Protocol", kControlSchemaVersion);
+    if (archive_recording_.load()) {
+        control_websocket_->SetHeader("Voice-Lab-Archive-Run", recording_id_.c_str());
+        control_websocket_->SetHeader("Voice-Lab-Archive-Boot", std::to_string(boot_id_).c_str());
+    }
     control_websocket_->SetReceiveBufferSize(4096);
 
     control_websocket_->OnData([this](const char* data, size_t len, bool binary) {
@@ -1172,7 +1176,8 @@ bool VoiceLabClient::EnsureControlTask() {
                 ESP_LOGW(TAG, "Control heartbeat expired: rx_age_ms=%lld; reconnect required",
                          static_cast<long long>((now - client->last_control_rx_us_.load()) / 1000));
                 client->control_epoch_.fetch_add(1);
-                client->AbortRecording();
+                if (!client->archive_recording_.load())
+                    client->AbortRecording();
             }
             if (!client->recording_.load())
                 return;
@@ -1180,7 +1185,8 @@ bool VoiceLabClient::EnsureControlTask() {
             if (VoiceLabRecordingLease::DeadlineExpired(client->recording_deadline_us_.load(),
                                                         now) ||
                 VoiceLabRecordingLease::DeadlineExpired(lease_deadline, now) ||
-                now - client->last_control_rx_us_.load() >= kControlSilenceLimitUs) {
+                (!client->archive_recording_.load() &&
+                 now - client->last_control_rx_us_.load() >= kControlSilenceLimitUs)) {
                 client->AbortRecording();
             }
         };
@@ -1629,6 +1635,36 @@ void VoiceLabClient::MaybeRenewRecordingLease() {
     SendJson(json, epoch);
 }
 
+bool VoiceLabClient::InitializeArchive() {
+    const auto storage_path = Board::GetInstance().GetRecordingStoragePath();
+    if (storage_path.empty())
+        return false;
+    return archive_.Initialize(storage_path, [this](const std::string& method,
+                                                    const std::string& path,
+                                                    const std::string& body, bool binary) {
+        if (!IsConnected() || !Board::GetInstance().IsNetworkConnected())
+            return std::string{};
+        auto http = Board::GetInstance().GetNetwork()->CreateHttp(4);
+        http->SetTimeout(3000);
+        http->SetHeader("X-Device-Token", GetDeviceToken());
+        http->SetHeader("Content-Type", binary ? "application/octet-stream" : "application/json");
+        http->SetContent(std::string(body));
+        const auto url =
+            BuildHttpUrl("/api/v1/devices/" + GetDeviceKey() + "/offline-audio" + path);
+        if (!http->Open(method, url)) {
+            ESP_LOGW(TAG, "Archive HTTP open failed: %s %s", method.c_str(), path.c_str());
+            return std::string{};
+        }
+        const auto code = http->GetStatusCode();
+        auto result = code > 0 ? http->ReadAll() : std::string{};
+        http->Close();
+        if (code != 200)
+            ESP_LOGW(TAG, "Archive HTTP failed: status=%d path=%s response=%.200s", code,
+                     path.c_str(), result.c_str());
+        return code == 200 ? result : std::string{};
+    });
+}
+
 bool VoiceLabClient::StartAuthorizedRecording(const std::string& recording_id,
                                               const std::string& mode, int revision,
                                               uint32_t authorized_epoch, const cJSON* authorization,
@@ -1723,6 +1759,8 @@ bool VoiceLabClient::StartAuthorizedRecording(const std::string& recording_id,
         unacknowledged_audio_.clear();
         acknowledged_sample_end_.store(sample_start_);
         sent_sample_end_.store(sample_start_);
+        realtime_window_start_ = sample_start_;
+        archive_captured_samples_ = 0;
         audio_frames_sent_ = 0;
         audio_bytes_sent_ = 0;
         last_audio_stats_us_ = 0;
@@ -1760,6 +1798,20 @@ bool VoiceLabClient::StartAuthorizedRecording(const std::string& recording_id,
     // absolute deadline keeps administrator capture running until a stop or fault.
     audio_service.EnableVoiceProcessing(false);
     audio_service.EnableWakeWordDetection(false);
+    archive_recording_.store(false);
+    archive_live_suspended_.store(false);
+    archive_realtime_mode_.store(mode == "meeting_live");
+    archive_realtime_gap_.store(false);
+    const auto storage_path = Board::GetInstance().GetRecordingStoragePath();
+    if (!storage_path.empty()) {
+        const bool initialized = InitializeArchive();
+        archive_sample_start_ = sample_start_;
+        if (!initialized || !archive_.Begin(recording_id_, boot_id_, sample_start_)) {
+            SetUserState(UserState::Error);
+            return false;
+        }
+        archive_recording_.store(true);
+    }
     first_pcm_received_.store(false);
     bool opened = false;
     {
@@ -1772,6 +1824,8 @@ bool VoiceLabClient::StartAuthorizedRecording(const std::string& recording_id,
         }
     }
     if (!opened) {
+        if (archive_recording_.exchange(false))
+            archive_.Finish(true);
         std::lock_guard<std::mutex> lock(media_mutex_);
         CloseAudioLocked();
         SetUserState(UserState::Error);
@@ -1820,7 +1874,10 @@ bool VoiceLabClient::StopRecording() {
     recording_mode_ = "idle";
     if (!capture_stopped)
         interrupted_.store(true);
-    const uint64_t capture_sample_end = CaptureSampleEnd();
+    const bool archived = archive_recording_.load();
+    const bool disk_complete = archived && archive_.Finish(interrupted_.load() || !capture_stopped);
+    const uint64_t capture_sample_end =
+        archived ? archive_sample_start_ + archive_.Samples() : CaptureSampleEnd();
     SetUserState(UserState::Stopping);
     cJSON* stopped = cJSON_CreateObject();
     cJSON_AddStringToObject(stopped, "type", "status");
@@ -1842,7 +1899,8 @@ bool VoiceLabClient::StopRecording() {
     const auto tail_deadline = esp_timer_get_time() + kAudioDrainTimeoutMs * 1000LL;
     // Stop capture immediately, but retain the same media recovery path until
     // the captured cutoff is acknowledged. A transient disconnect is retryable.
-    while (!interrupted_.load() && esp_timer_get_time() < tail_deadline) {
+    while (!archive_live_suspended_.load() && !interrupted_.load() &&
+           esp_timer_get_time() < tail_deadline) {
         {
             std::lock_guard<std::mutex> lock(media_mutex_);
             PumpMediaLocked(true);
@@ -1882,18 +1940,29 @@ bool VoiceLabClient::StopRecording() {
         }
         unacknowledged_audio_.clear();
     }
+    if (archived) {
+        if (capture_sample_end > sample_start_) {
+            audio_sequence_ += (capture_sample_end - sample_start_) / kPcmSamplesPerFrame;
+            sample_start_ = capture_sample_end;
+        }
+        archive_recording_.store(false);
+    }
+    const bool locally_saved = disk_complete && !interrupted_.load();
     tail_pending_.store(false);
-    interrupted_.store(!complete);
-    SetUserState(complete ? UserState::Ready : UserState::Error);
-    QueueVoiceLabPrompt(complete ? VoiceLabPrompt::RecordingStopped : VoiceLabPrompt::Interrupted);
+    interrupted_.store(!complete && !locally_saved);
+    SetUserState((complete || locally_saved) ? UserState::Ready : UserState::Error);
+    QueueVoiceLabPrompt((complete || locally_saved) ? VoiceLabPrompt::RecordingStopped
+                                                    : VoiceLabPrompt::Interrupted);
     cJSON* final = cJSON_CreateObject();
     cJSON_AddStringToObject(final, "type", "status");
     cJSON_AddStringToObject(final, "mode", "idle");
     cJSON_AddBoolToObject(final, "recording", false);
     cJSON_AddBoolToObject(final, "paused", false);
     cJSON_AddStringToObject(final, "finalizationState",
-                            complete ? "audio_confirmed" : "interrupted");
-    if (!complete)
+                            complete && !archive_.ManualRecovery() ? "audio_confirmed"
+                            : locally_saved                        ? "local_pending"
+                                                                   : "interrupted");
+    if (!complete && !locally_saved)
         cJSON_AddStringToObject(final, "error", "audio_not_fully_confirmed");
     AppendCaptureIdentity(final);
     const auto final_json = PrintJson(final);
@@ -1905,7 +1974,7 @@ bool VoiceLabClient::StopRecording() {
         active_session_id_.clear();
         lease_deadline_us_.store(0);
     }
-    return complete;
+    return complete || locally_saved;
 }
 
 bool VoiceLabClient::RequestPlayback(const std::string& url) {
@@ -1956,11 +2025,32 @@ bool VoiceLabClient::SendPcmAudio(std::vector<int16_t>&& pcm) {
     }
 
     std::lock_guard<std::mutex> lock(pcm_mutex_);
-    if (!recording_.load()) {
+    if (!recording_.load())
         return false;
+    if (archive_recording_.load()) {
+        if (!archive_.Push(pcm)) {
+            AbortRecording();
+            return false;
+        }
+        archive_captured_samples_ += pcm.size();
+        first_pcm_received_.store(true);
+        if (archive_live_suspended_.load())
+            return true;
     }
     if (pending_audio_pcm_.size() + pcm.size() >
         static_cast<size_t>(kMaxPendingPcmFrames * kPcmSamplesPerFrame)) {
+        if (archive_recording_.load()) {
+            archive_.RequireManualRecovery();
+            archive_realtime_gap_.store(true);
+            archive_live_suspended_.store(true);
+            // Require a fresh server admission before starting another live span.
+            audio_accepted_.store(false);
+            audio_connected_.store(false);
+            ESP_LOGW(
+                TAG,
+                "Realtime buffer full; capture continues on TF card, manual recovery required");
+            return true;
+        }
         ESP_LOGW(TAG, "Voice Lab PCM buffer full; rejecting capture chunk");
         AbortRecording();
         return false;
@@ -1979,9 +2069,50 @@ bool VoiceLabClient::SendPcmAudio(std::vector<int16_t>&& pcm) {
 }
 
 void VoiceLabClient::PumpMedia() {
+    if (!recording_.load()) {
+        static int64_t next_storage_check = 0;
+        const auto now = esp_timer_get_time();
+        if (now >= next_storage_check) {
+            next_storage_check = now + 5000000;
+            InitializeArchive();
+        }
+    }
+    if (archive_recording_.load() && archive_.Failed()) {
+        AbortRecording();
+        return;
+    }
     if (!recording_.load())
         return;
     std::lock_guard<std::mutex> media(media_mutex_);
+    if (archive_live_suspended_.load()) {
+        if (!archive_realtime_mode_.load() || !IsConnected())
+            return;
+        if (!audio_connected_.load() || !audio_accepted_.load()) {
+            PumpMediaLocked(false);
+            return;
+        }
+        std::lock_guard<std::mutex> pcm(pcm_mutex_);
+        if (!recording_.load() || interrupted_.load() || archive_.Failed())
+            return;
+        const auto live_start = archive_sample_start_ + archive_captured_samples_;
+        if (live_start < sample_start_ || (live_start - sample_start_) % kPcmSamplesPerFrame != 0) {
+            AbortRecording();
+            return;
+        }
+        // Old queued/unacknowledged PCM remains in the TF archive. Resume at the
+        // current capture position; never compress the offline sample interval.
+        pending_audio_pcm_.clear();
+        unacknowledged_audio_.clear();
+        audio_sequence_ += (live_start - sample_start_) / kPcmSamplesPerFrame;
+        sample_start_ = live_start;
+        realtime_window_start_ = live_start;
+        archive_live_suspended_.store(false);
+        ESP_LOGW(TAG,
+                 "Realtime resumed after TF fallback: last_ack=%llu live_start=%llu; "
+                 "offline interval retained for manual archive upload",
+                 static_cast<unsigned long long>(acknowledged_sample_end_.load()),
+                 static_cast<unsigned long long>(live_start));
+    }
     PumpMediaLocked(false);
 }
 
@@ -2052,7 +2183,8 @@ bool VoiceLabClient::FlushPendingAudioLocked() {
         unacknowledged_audio_.pop_front();
     }
     const auto acknowledged = acknowledged_sample_end_.load();
-    const auto outstanding = sample_start_ > acknowledged ? sample_start_ - acknowledged : 0;
+    const auto outstanding = VoiceLabMediaPolicy::OutstandingSamples(sample_start_, acknowledged,
+                                                                     realtime_window_start_);
     const size_t frames_to_send =
         VoiceLabMediaPolicy::BatchFrames(pending_frames, outstanding, !recording_.load());
     if (!frames_to_send)
@@ -2430,6 +2562,10 @@ std::string VoiceLabClient::GetStatusJson() const {
     cJSON_AddBoolToObject(root, "audio_finalization_pending",
                           tail_pending_.load() && !recording_.load());
     cJSON_AddBoolToObject(root, "interrupted", interrupted_.load());
+    cJSON_AddBoolToObject(root, "localRecording", archive_recording_.load());
+    cJSON_AddBoolToObject(root, "localUploadPending", HasLocalPendingAudio());
+    cJSON_AddBoolToObject(root, "realtimeAudioGap", HasRealtimeAudioGap());
+    cJSON_AddNumberToObject(root, "localSavedSamples", static_cast<double>(archive_.Samples()));
     cJSON_AddNumberToObject(root, "legacy_recording_limit_seconds", 0);
     cJSON_AddStringToObject(root, "recording_authorization",
                             "session_lease_or_fresh_admin_revision_after_idle");

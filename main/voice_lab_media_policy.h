@@ -27,4 +27,12 @@ struct VoiceLabMediaPolicy {
         const auto batch = pending_frames < kBatchFrames ? pending_frames : kBatchFrames;
         return batch < room ? batch : room;
     }
+
+    // A TF-backed discontinuity starts a new live window without pretending the
+    // missing interval was acknowledged. The original sample/sequence gap remains.
+    static constexpr uint64_t OutstandingSamples(uint64_t sent, uint64_t acknowledged,
+                                                 uint64_t live_start) {
+        const auto committed = acknowledged > live_start ? acknowledged : live_start;
+        return sent > committed ? sent - committed : 0;
+    }
 };
