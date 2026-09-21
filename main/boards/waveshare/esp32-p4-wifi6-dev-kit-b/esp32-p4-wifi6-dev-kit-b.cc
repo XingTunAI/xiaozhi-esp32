@@ -1,6 +1,7 @@
 #include "audio/codecs/dummy_audio_codec.h"
 #include "audio/codecs/es8311_audio_codec.h"
 #include "board_peripherals.h"
+#include "board_scale.h"
 #include "config.h"
 #include "counter_display.h"
 #include "display/lcd_display.h"
@@ -91,6 +92,8 @@ public:
     bool IsNetworkConnected() const override { return IsBoardNetworkConnected(); }
 
     bool HandleConsoleCommand(const std::string& command) override {
+        if (HandleBoardScaleCommand(command))
+            return true;
         if (command == "p4 ui-freeze" || command == "p4 ui-resume") {
             static_cast<CounterDisplay*>(display_)->SetDiagnosticFreeze(command == "p4 ui-freeze");
             ESP_LOGI(TAG, "UI diagnostic freeze=%d", command == "p4 ui-freeze");
