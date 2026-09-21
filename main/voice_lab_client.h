@@ -20,6 +20,7 @@
 #include "voice_lab_recording_lease.h"
 
 #include <web_socket.h>
+#include <http.h>
 
 class VoiceLabClient {
 public:
@@ -43,6 +44,8 @@ public:
     bool IsConnected() const;
     bool IsRecording() const { return recording_.load(); }
     bool IsLocallyRecording() const { return recording_.load() && archive_recording_.load(); }
+    bool LocalBackupUnavailable() const { return local_backup_unavailable_.load(); }
+    bool MaintainRecordingStorage(const std::function<bool()>& maintenance);
     bool HasLocalPendingAudio() const { return archive_.ManualRecovery(); }
     bool HasRealtimeAudioGap() const { return archive_realtime_gap_.load(); }
 
@@ -84,6 +87,7 @@ private:
     bool InitializeArchive();
     VoiceLabArchive archive_;
     std::atomic<bool> archive_recording_{false}, archive_live_suspended_{false};
+    std::atomic<bool> local_backup_unavailable_{false};
     std::atomic<bool> archive_realtime_mode_{false};
     std::atomic<bool> archive_realtime_gap_{false};
     uint64_t archive_sample_start_ = 0;
@@ -94,6 +98,9 @@ private:
 
     mutable std::mutex mutex_;  // Control socket only; never guards PCM/media I/O.
     mutable std::mutex media_mutex_;
+    std::mutex archive_http_mutex_;
+    std::unique_ptr<Http> archive_http_;
+    std::string archive_http_endpoint_;
     mutable std::mutex binding_mutex_;
     std::atomic<bool> binding_active_{false};
     bool binding_announce_ = true;  // Written before spawning the single binding worker.

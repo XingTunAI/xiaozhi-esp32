@@ -1,5 +1,6 @@
 #include "board_peripherals.h"
 #include "c6_update.h"
+#include "voice_lab_client.h"
 
 #include <driver/gpio.h>
 #include <driver/sdmmc_host.h>
@@ -70,6 +71,7 @@ QueueHandle_t commands = nullptr;
 bool wifi_initialized = false;
 bool wifi_reconnect = false;
 bool sd_mounted = false;
+bool sd_recovery_blocked = false;
 sdmmc_card_t* mounted_card = nullptr;
 sd_pwr_ctrl_handle_t mounted_sd_power = nullptr;
 std::string IpText(const esp_ip4_addr_t& ip) {
@@ -586,17 +588,25 @@ esp_err_t StartUsbAudio() {
     return uac2_host_install(&uac2);
 }
 
-esp_err_t StartSdCard() {
+esp_err_t StartSdCard(bool force = false, unsigned attempt = 0) {
+    if (sd_recovery_blocked)
+        return ESP_ERR_INVALID_STATE;
     if (sd_mounted) {
-        void* sector = heap_caps_aligned_alloc(64, 512, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-        if (!sector)
-            return ESP_ERR_NO_MEM;
-        const auto read = sdmmc_read_sectors(mounted_card, sector, 0, 1);
-        free(sector);
-        if (read == ESP_OK)
-            return ESP_OK;
+        if (!force) {
+            void* sector = heap_caps_aligned_alloc(64, 512, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+            if (!sector)
+                return ESP_ERR_NO_MEM;
+            const auto read = sdmmc_read_sectors(mounted_card, sector, 0, 1);
+            free(sector);
+            if (read == ESP_OK)
+                return ESP_OK;
+        }
         const auto unmount = esp_vfs_fat_sdcard_unmount("/sdcard", mounted_card);
+        // The VFS unmount can free its context/card even when path removal fails.
+        mounted_card = nullptr;
+        sd_mounted = false;
         if (unmount != ESP_OK) {
+            sd_recovery_blocked = true;
             std::lock_guard<std::mutex> lock(status_mutex);
             status.storage = "卡片不可读，请重启后重新检测";
             return unmount;
@@ -607,9 +617,12 @@ esp_err_t StartSdCard() {
         sd_mounted = false;
     }
     // Rev1.2: SD power switch is active-low. SD uses slot 0, C6 uses slot 1.
-    gpio_set_level(GPIO_NUM_45, 0);
+    gpio_set_level(GPIO_NUM_45, 1);
     gpio_set_direction(GPIO_NUM_45, GPIO_MODE_OUTPUT);
-    vTaskDelay(pdMS_TO_TICKS(20));
+    // Slot has been released before changing power; no global host deinit.
+    vTaskDelay(pdMS_TO_TICKS(200));
+    gpio_set_level(GPIO_NUM_45, 0);
+    vTaskDelay(pdMS_TO_TICKS(100));
     sd_pwr_ctrl_ldo_config_t power = {};
     power.ldo_chan_id = 4;
     sd_pwr_ctrl_handle_t power_handle = nullptr;
@@ -618,7 +631,9 @@ esp_err_t StartSdCard() {
         return err;
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
     host.slot = 0;
-    host.max_freq_khz = SDMMC_FREQ_DEFAULT;
+    host.max_freq_khz = attempt ? SDMMC_FREQ_PROBING : SDMMC_FREQ_DEFAULT;
+    host.flags |= SDMMC_HOST_FLAG_DEINIT_ARG;
+    host.deinit_p = sdmmc_host_deinit_slot;
     host.pwr_ctrl_handle = power_handle;
     sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
     slot.width = 4;
@@ -636,8 +651,13 @@ esp_err_t StartSdCard() {
     err = esp_vfs_fat_sdmmc_mount("/sdcard", &host, &slot, &mount, &card);
     if (err != ESP_OK) {
         sd_pwr_ctrl_del_on_chip_ldo(power_handle);
+        gpio_set_level(GPIO_NUM_45, 1);
+        ESP_LOGW(TAG, "SD mount attempt %u failed: %s; TF slot 0 only", attempt + 1,
+                 esp_err_to_name(err));
+        if (attempt == 0)
+            return StartSdCard(true, 1);
         std::lock_guard<std::mutex> lock(status_mutex);
-        status.storage = err == ESP_ERR_TIMEOUT ? "未插入 SD 卡" : "无法挂载，请检查卡片和文件系统";
+        status.storage = std::string("初始化失败: ") + esp_err_to_name(err);
         return err;
     }
     sd_mounted = true;
@@ -652,6 +672,33 @@ esp_err_t StartSdCard() {
     ESP_LOGI(TAG, "SD card mounted; sectors=%lu sector_size=%d; no test files written",
              static_cast<unsigned long>(card->csd.capacity), card->csd.sector_size);
     return ESP_OK;
+}
+
+void RecoverSdCard() {
+    bool attempted = false;
+    const bool ready = VoiceLabClient::GetInstance().MaintainRecordingStorage([&]() {
+        attempted = true;
+        {
+            std::lock_guard<std::mutex> lock(status_mutex);
+            status.storage = "正在初始化";
+            status.storage_action = "正在检测";
+        }
+        const auto err = StartSdCard(true);
+        ESP_LOGI(TAG, "SD recovery finished: %s", esp_err_to_name(err));
+        {
+            std::lock_guard<std::mutex> lock(status_mutex);
+            status.storage_action = err == ESP_OK ? "检测完成" : "检测失败";
+            if (err != ESP_OK && status.storage == "正在初始化")
+                status.storage = std::string("初始化失败: ") + esp_err_to_name(err);
+        }
+        return err == ESP_OK;
+    });
+    if (!ready && !attempted) {
+        ESP_LOGW(TAG, "SD recovery deferred: recording/start/stop or archive I/O busy");
+        std::lock_guard<std::mutex> lock(status_mutex);
+        status.storage_action = "正在录音或读写，请稍后重试";
+        // Preserve the mount state: declining a recovery is not a card failure.
+    }
 }
 
 void Initialize(void*) {
@@ -709,7 +756,7 @@ void Initialize(void*) {
         else if (command.type == 2)
             ConnectWifi(command);
         else if (command.type == 3)
-            StartSdCard();
+            RecoverSdCard();
         else if (command.type == 4)
             UpdateC6Firmware(command.update_url);
         memset(command.password, 0, sizeof(command.password));

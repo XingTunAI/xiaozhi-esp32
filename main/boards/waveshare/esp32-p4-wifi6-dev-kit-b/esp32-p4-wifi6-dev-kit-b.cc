@@ -3,6 +3,7 @@
 #include "board_peripherals.h"
 #include "board_scale.h"
 #include "config.h"
+#include "counter_ble.h"
 #include "counter_display.h"
 #include "display/lcd_display.h"
 #include "lcd_init_cmds.h"
@@ -66,7 +67,7 @@ public:
                     i2c_bus_, I2C_NUM_1, AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
                     AUDIO_I2S_GPIO_MCLK, AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS,
                     AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN, AUDIO_CODEC_PA_PIN,
-                    ES8311_CODEC_DEFAULT_ADDR, true, true);
+                    ES8311_CODEC_DEFAULT_ADDR, true, true, 1);
             } else {
                 ESP_LOGW(TAG, "ES8311 absent; audio unavailable, keeping UI operational");
                 codec_ = new DummyAudioCodec(24000, 24000);
@@ -83,6 +84,7 @@ public:
                     connected ? NetworkEvent::Connected : NetworkEvent::Disconnected, "");
             }
         });
+        StartCounterBle();
     }
 
     std::string GetRecordingStoragePath() const override {
@@ -90,10 +92,41 @@ public:
         return status.storage.find("已挂载") == 0 ? "/sdcard" : "";
     }
     bool IsNetworkConnected() const override { return IsBoardNetworkConnected(); }
+    std::string GetAudioFrontendIdentity() const override { return "p4-pdm-usb-selectable"; }
+    std::string GetAudioFrontendFirmwareIdentity() const override { return "p4-mm-afe-usb-v1"; }
 
     bool HandleConsoleCommand(const std::string& command) override {
         if (HandleBoardScaleCommand(command))
             return true;
+        if (command == "p4 employee") {
+            static_cast<CounterDisplay*>(display_)->ShowEmployeePage();
+            ESP_LOGI(TAG, "Employee device page opened");
+            return true;
+        }
+        if (command == "p4 audio gain 1" || command == "p4 audio gain 2" ||
+            command == "p4 audio gain 4") {
+            SelectBoardPdmGain(command.back() - '0');
+            ESP_LOGI(TAG, "Next raw PDM gain: x%d", board_pdm_gain.load());
+            return true;
+        }
+        if (command == "p4 audio left" || command == "p4 audio right" ||
+            command == "p4 audio afe") {
+            SelectBoardPdmMode(command == "p4 audio left"    ? 0
+                               : command == "p4 audio right" ? 1
+                                                             : 2);
+            SelectBoardPdm(true);
+            ESP_LOGI(TAG, "Next recording input: %s", BoardPdmModeName());
+            return true;
+        }
+        if (command == "p4 audio pdm" || command == "p4 audio usb" ||
+            command == "p4 audio status") {
+            if (command != "p4 audio status")
+                SelectBoardPdm(command == "p4 audio pdm");
+            ESP_LOGI(TAG, "Next recording input: %s",
+                     BoardPdmSelected() ? BoardPdmModeName() : "USB");
+            ESP_LOGI(TAG, "Next raw PDM gain: x%d (USB/AFE unchanged)", board_pdm_gain.load());
+            return true;
+        }
         if (command == "p4 ui-freeze" || command == "p4 ui-resume") {
             static_cast<CounterDisplay*>(display_)->SetDiagnosticFreeze(command == "p4 ui-freeze");
             ESP_LOGI(TAG, "UI diagnostic freeze=%d", command == "p4 ui-freeze");

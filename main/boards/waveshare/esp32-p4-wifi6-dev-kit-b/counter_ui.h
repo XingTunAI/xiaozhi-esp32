@@ -1,13 +1,16 @@
 #pragma once
 #include <lvgl.h>
 #include <atomic>
+#include "counter_quote.h"
 
 class CounterUi {
 public:
     void Show(lv_obj_t* parent);
+    void ShowQuote(const CounterQuote& quote);
     // Physical-console smoke test uses the same event as a touch, under LVGL lock.
     bool PressRecordingButton();
     void ShowAccountPage() { Render(7); }
+    void ShowEmployeePage() { Render(8); }
     bool PressBindingButton() {
         if (!binding_button_)
             return false;
@@ -18,6 +21,9 @@ public:
 
 private:
     lv_obj_t* root_ = nullptr;
+    CounterQuote quote_;
+    bool has_quote_ = false;
+    void RenderQuote();
     bool diagnostic_freeze_ = false;
     lv_obj_t* recording_button_ = nullptr;
     lv_obj_t* recording_label_ = nullptr;

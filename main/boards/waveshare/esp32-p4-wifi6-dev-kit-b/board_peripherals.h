@@ -13,6 +13,7 @@ struct BoardPeripheralStatus {
     std::string wifi_ssid;
     std::string c6_version = "尚未读取";
     std::string storage = "未插入 SD 卡";
+    std::string storage_action;
     std::string usb = "正在初始化";
     unsigned audio_interfaces = 0;
     bool wifi_busy = false;

@@ -1086,6 +1086,16 @@ config USE_AUDIO_DEBUGGER
     help
         Enable audio debugger, send audio data through UDP to the host machine
 
+config COUNTER_BLE_LINK
+    bool "Counter terminal BLE connection probe"
+    default n
+    depends on BOARD_TYPE_WAVESHARE_ESP32_P4_WIFI6_DEV_KIT_B
+    depends on BT_NIMBLE_ENABLED && ESP_HOSTED_ENABLE_BT_NIMBLE
+    depends on !USE_ESP_BLUFI_WIFI_PROVISIONING
+    help
+        Expose device identity and a ping/reply service to the WeChat mini program.
+        This first-stage service does not change display or recording state.
+
 menu "WiFi Configuration Method"
     help
         WiFi Configuration Method Selection

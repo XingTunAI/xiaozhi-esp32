@@ -40,3 +40,8 @@ static_assert(P::BatchFrames(25, P::OutstandingSamples(1024000, 8000, 960000), f
               "resuming must retain the bounded four-second window");
 static_assert(!P::TailConfirmed(0, true, true, 8000, 960000),
               "a new live window is not a fabricated ACK for the offline interval");
+
+static_assert(!P::CanUploadArchive(true, true), "recording defers archive even with tail flag");
+static_assert(!P::CanUploadArchive(true, false), "new recording pauses previous archive");
+static_assert(!P::CanUploadArchive(false, true), "stop drain has priority");
+static_assert(P::CanUploadArchive(false, false), "idle resumes archive");

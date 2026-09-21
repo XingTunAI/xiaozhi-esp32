@@ -1,5 +1,7 @@
 #include "board_peripherals.h"
+#include "counter_ble.h"
 #include "counter_ui.h"
+#include "usb_capture_codec.h"
 #include "voice_lab_client.h"
 
 #include <esp_app_desc.h>
@@ -58,6 +60,7 @@ void CounterUi::RenderSettings(int page) {
     Button(root_, 32, 190, 210, "版本信息", this, 5, SettingsAction);
     Button(root_, 32, 262, 210, "存储与音频", this, 6, SettingsAction);
     Button(root_, 32, 334, 210, "账号与绑定", this, 7, SettingsAction);
+    Button(root_, 32, 406, 210, "员工设备入口", this, 8, SettingsAction);
     Label(root_, 36, 656, 1170, "本机设置 · 网络配置保存到设备；演示计价与录音状态保持不变",
           0x94A49B);
     if (page == 4) {
@@ -159,13 +162,28 @@ void CounterUi::RenderSettings(int page) {
         settings_hint_ = Label(
             root_, 284, 500, 948,
             "入口：voice-lab.cloud/tingjian/guide\n二维码仅打开网页，不包含账号密码。", 0x94A49B);
-    } else {
+    } else if (page == 6) {
         settings_status_ = Label(root_, 284, 104, 948, "正在读取外设状态");
         Button(root_, 284, 470, 300, "检测 SD 卡", this, 102, SettingsAction);
         settings_hint_ = Label(
             root_, 284, 548, 940,
             "无卡可以正常使用。检测不会格式化或创建文件。\nUSB 音频外设接 USB-A，拨动开关置 HOST。",
             0x94A49B);
+    }
+    if (page == 8) {
+        uint8_t mac[6]{};
+        esp_read_mac(mac, ESP_MAC_BASE);
+        char identity[200];
+        snprintf(identity, sizeof(identity),
+                 "XingTun-P4-%02X%02X%02X\n设备编号：%02x%02x%02x%02x%02x%02x", mac[3], mac[4],
+                 mac[5], mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        Label(root_, 284, 120, 900, identity, GOLD);
+        settings_status_ = Label(root_, 284, 240, 900, "等待员工连接");
+        Button(root_, 284, 370, 420, "确认当前连接", this, 110, SettingsAction);
+        Label(root_, 284, 450, 900,
+              "仅确认本次蓝牙连接，断开后失效。\n本机记录不代表门店归属绑定。\n正式小程序码尚未配置"
+              "，请从手机小程序连接设备。",
+              0x94A49B);
     }
     if (!settings_timer_) {
         settings_timer_ = lv_timer_create(
@@ -180,6 +198,13 @@ void CounterUi::RenderSettings(int page) {
 void CounterUi::UpdateSettings() {
     if (page_ < 4 || !settings_status_)
         return;
+    if (page_ == 8) {
+        const int state = CounterBleApprovalState();
+        SetText(settings_status_, state == 2   ? "当前连接已在设备上确认"
+                                  : state == 1 ? "员工请求确认，请核对手机后点击下方按钮"
+                                               : "等待员工在小程序中申请确认");
+        return;
+    }
     if (page_ == 7) {
         auto& client = VoiceLabClient::GetInstance();
         const auto code = client.GetBindingCode();
@@ -234,13 +259,14 @@ void CounterUi::UpdateSettings() {
         SetText(settings_status_, details);
     } else {
         SetText(settings_status_,
-                "SD 卡：" + state.storage + "\n\nUSB 主机：" + state.usb +
-                    "\n已识别 USB 音频接口：" + std::to_string(state.audio_interfaces) +
+                "SD 卡：" + state.storage + "\n" + state.storage_action + "\n\nUSB 主机：" +
+                    state.usb + "\n已识别 USB 音频接口：" + std::to_string(state.audio_interfaces) +
                     "\n\nVoice Lab: " +
                     (VoiceLabClient::GetInstance().IsConnected() ? "online" : "offline") +
-                    "\nUSB capture: " +
+                    "\nCapture: " +
                     (VoiceLabClient::GetInstance().IsRecording() ? "recording" : "idle") +
-                    "\nPlayback: ES8311");
+                    "\n下次录音：" + (BoardPdmSelected() ? BoardPdmModeName() : "USB 声卡") +
+                    "    Playback: ES8311");
     }
 }
 
@@ -252,6 +278,11 @@ void CounterUi::SettingsAction(lv_event_t* event) {
         return;
     }
     bool accepted = false;
+    if (action == 110) {
+        CounterBleApprove();
+        self->UpdateSettings();
+        return;
+    }
     if (action == 100)
         accepted = RequestBoardWifiScan();
     else if (action == 101) {

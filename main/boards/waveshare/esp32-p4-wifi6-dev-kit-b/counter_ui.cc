@@ -2,6 +2,8 @@
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <cstdio>
+#include <string>
 #include "counter_ui_layout.h"
 #include "voice_lab_client.h"
 
@@ -48,33 +50,37 @@ void CounterUi::Render(int page) {
         RenderRecordingControls();
         return;
     }
-    const auto& layout = kCounterPages[page];
-    for (size_t i = 0; i < layout.count; ++i) {
-        const auto& item = layout.items[i];
-        if (item.text == nullptr) {
-            CreateBox(root_, item);
-            continue;
-        }
-        lv_obj_t* parent = root_;
-        if (item.action >= 0) {
-            parent = CreateBox(root_, item);
-            lv_obj_add_flag(parent, LV_OBJ_FLAG_CLICKABLE);
-            lv_obj_set_user_data(parent, this);
-            lv_obj_add_event_cb(parent, OnAction, LV_EVENT_CLICKED,
-                                const_cast<CounterUiItem*>(&item));
-            lv_obj_set_style_bg_opa(parent, LV_OPA_80, LV_STATE_PRESSED);
-        }
-        auto label = lv_label_create(parent);
-        lv_label_set_text(label, item.text);
-        lv_obj_set_style_text_font(label, item.font, 0);
-        lv_obj_set_style_text_color(label, lv_color_hex(item.ink), 0);
-        if (item.action >= 0) {
-            lv_obj_center(label);
-        } else {
-            lv_obj_set_pos(label, item.x, item.y);
-            lv_obj_set_width(label, item.w);
-            lv_label_set_long_mode(label, LV_LABEL_LONG_CLIP);
-            lv_obj_set_style_text_align(label, item.align, 0);
+    if (has_quote_) {
+        RenderQuote();
+    } else {
+        const auto& layout = kCounterPages[page];
+        for (size_t i = 0; i < layout.count; ++i) {
+            const auto& item = layout.items[i];
+            if (item.text == nullptr) {
+                CreateBox(root_, item);
+                continue;
+            }
+            lv_obj_t* parent = root_;
+            if (item.action >= 0) {
+                parent = CreateBox(root_, item);
+                lv_obj_add_flag(parent, LV_OBJ_FLAG_CLICKABLE);
+                lv_obj_set_user_data(parent, this);
+                lv_obj_add_event_cb(parent, OnAction, LV_EVENT_CLICKED,
+                                    const_cast<CounterUiItem*>(&item));
+                lv_obj_set_style_bg_opa(parent, LV_OPA_80, LV_STATE_PRESSED);
+            }
+            auto label = lv_label_create(parent);
+            lv_label_set_text(label, item.text);
+            lv_obj_set_style_text_font(label, item.font, 0);
+            lv_obj_set_style_text_color(label, lv_color_hex(item.ink), 0);
+            if (item.action >= 0) {
+                lv_obj_center(label);
+            } else {
+                lv_obj_set_pos(label, item.x, item.y);
+                lv_obj_set_width(label, item.w);
+                lv_label_set_long_mode(label, LV_LABEL_LONG_CLIP);
+                lv_obj_set_style_text_align(label, item.align, 0);
+            }
         }
     }
     // Staff can long-press the brand area without adding a customer-facing button.
@@ -91,6 +97,51 @@ void CounterUi::Render(int page) {
         },
         LV_EVENT_LONG_PRESSED, this);
     RenderRecordingControls();
+}
+
+void CounterUi::ShowQuote(const CounterQuote& quote) {
+    quote_ = quote;
+    has_quote_ = true;
+    if (root_)
+        Render(0);
+}
+
+void CounterUi::RenderQuote() {
+    auto label = [this](int x, int y, int width, const char* text, const lv_font_t* font,
+                        uint32_t color) {
+        auto* obj = lv_label_create(root_);
+        lv_obj_set_pos(obj, x, y);
+        lv_obj_set_width(obj, width);
+        lv_label_set_long_mode(obj, LV_LABEL_LONG_DOT);
+        lv_label_set_text(obj, text);
+        lv_obj_set_style_text_font(obj, font, 0);
+        lv_obj_set_style_text_color(obj, lv_color_hex(color), 0);
+    };
+    auto money = [](uint64_t fen) {
+        char value[40];
+        snprintf(value, sizeof(value), "¥%llu.%02llu", (unsigned long long)(fen / 100),
+                 (unsigned long long)(fen % 100));
+        return std::string(value);
+    };
+    label(56, 22, 1000, "星豚 · 智慧柜台", &counter_font_28, 0xf2f0e8);
+    label(56, 91, 1000, "透明计价  安心选购", &counter_font_20, 0x94a49b);
+    label(56, 170, 1168, quote_.name, &counter_font_32, 0xf2f0e8);
+    label(56, 228, 550, quote_.material, &counter_font_24, 0xe4c58a);
+    char weight[40];
+    snprintf(weight, sizeof(weight), "%lu.%03lu g", (unsigned long)(quote_.weight_mg / 1000),
+             (unsigned long)(quote_.weight_mg % 1000));
+    label(56, 300, 550, "商品克重", &counter_font_20, 0x94a49b);
+    label(56, 340, 550, weight, &counter_font_44, 0xf2f0e8);
+    label(56, 440, 550, "元/克", &counter_font_20, 0x94a49b);
+    label(56, 478, 550, money(quote_.price_fen).c_str(), &counter_font_44, 0xe4c58a);
+    const char* names[] = {"金料金额", "工费", "优惠"};
+    const uint64_t amounts[] = {quote_.metal_fen, quote_.labor_fen, quote_.discount_fen};
+    for (int i = 0; i < 3; ++i) {
+        label(700, 290 + i * 58, 180, names[i], &counter_font_20, 0x94a49b);
+        label(890, 286 + i * 58, 350, money(amounts[i]).c_str(), &counter_font_24, 0xf2f0e8);
+    }
+    label(700, 478, 500, "本次计价", &counter_font_20, 0x94a49b);
+    label(700, 522, 548, money(quote_.total_fen).c_str(), &counter_font_44, 0xe4c58a);
 }
 
 void CounterUi::RenderRecordingControls() {
@@ -178,10 +229,11 @@ void CounterUi::UpdateRecordingControls() {
         const auto seconds = (esp_timer_get_time() - recording_started_us_) / 1000000;
         snprintf(elapsed, sizeof(elapsed), "正在录音  %02lld:%02lld%s",
                  static_cast<long long>(seconds / 60), static_cast<long long>(seconds % 60),
-                 client.IsLocallyRecording() ? (!client.IsConnected()          ? " · 离线录音中"
-                                                : client.HasRealtimeAudioGap() ? " · 转写有缺口"
-                                                                               : " · TF 卡保存中")
-                                             : (client.IsConnected() ? "" : " · 服务连接中"));
+                 client.IsLocallyRecording()
+                     ? (!client.IsConnected()          ? " · 离线录音中"
+                        : client.HasRealtimeAudioGap() ? " · 转写有缺口"
+                                                       : " · TF 卡保存中")
+                     : (client.IsConnected() ? " · 无本地保存" : " · 服务连接中"));
         action = "停止录音";
         hint = elapsed;
     } else if (state == State::Stopping) {
@@ -196,12 +248,13 @@ void CounterUi::UpdateRecordingControls() {
         hint = "等待服务端授权录音";
         enabled = false;
     } else if (state == State::Error || recording_action_failed_.load()) {
-        hint = "录音未完成，请检查服务端授权或网络";
+        hint = client.LocalBackupUnavailable() ? "存储不可用 · 录音未完成，请查看服务端"
+                                               : "录音未完成，请检查服务端授权或网络";
     }
     if (!recording && state != State::Error && state != State::Stopping &&
         !recording_action_failed_.load()) {
         if (client.HasLocalPendingAudio())
-            hint = "本次录音有异常 · 音频待补传";
+            hint = "录音已留存 · 在线后自动补传";
         else if (client.HasRealtimeAudioGap())
             hint = "本次录音已保存 · 转写不完整";
     }
@@ -211,7 +264,7 @@ void CounterUi::UpdateRecordingControls() {
         // Show actual recording activity, but keep technical recovery advice in settings.
         if (!recording && state != State::Stopping && state != State::Error &&
             !recording_action_failed_.load())
-            hint = client.HasLocalPendingAudio()  ? "本次录音有异常 · 音频待补传"
+            hint = client.HasLocalPendingAudio()  ? "录音已留存 · 在线后自动补传"
                    : client.HasRealtimeAudioGap() ? "本次录音已保存 · 转写不完整"
                    : recording_completed_         ? "录音已完成"
                                                   : "录音未开启";

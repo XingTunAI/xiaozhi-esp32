@@ -32,9 +32,17 @@ public:
         DisplayLockGuard guard(this);
         return ui_.PressRecordingButton();
     }
+    void ShowQuote(const CounterQuote& quote) {
+        DisplayLockGuard guard(this);
+        ui_.ShowQuote(quote);
+    }
     void ShowAccountPage() {
         DisplayLockGuard guard(this);
         ui_.ShowAccountPage();
+    }
+    void ShowEmployeePage() {
+        DisplayLockGuard guard(this);
+        ui_.ShowEmployeePage();
     }
     bool PressBindingButton() {
         DisplayLockGuard guard(this);

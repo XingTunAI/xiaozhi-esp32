@@ -281,6 +281,8 @@ std::string VoiceLabClient::GetHardwareProfile() const {
 }
 
 std::string VoiceLabClient::GetAudioFrontend() const {
+    auto board_identity = Board::GetInstance().GetAudioFrontendIdentity();
+    if (!board_identity.empty()) return board_identity;
     Settings settings("voice_lab", false);
     auto value = settings.GetString("audio_frontend", CONFIG_VOICE_LAB_AUDIO_FRONTEND);
     return value.empty() ? CONFIG_VOICE_LAB_AUDIO_FRONTEND : value;
@@ -1373,7 +1375,9 @@ void VoiceLabClient::SendHelloLocked() {
     cJSON_AddStringToObject(root, "bootId", boot_id.c_str());
     cJSON_AddStringToObject(root, "capabilitySchemaVersion", kCapabilitySchemaVersion);
     cJSON_AddStringToObject(root, "audioFrontend", GetAudioFrontend().c_str());
-    cJSON_AddStringToObject(root, "audioFrontendFirmware", kAudioFrontendFirmware);
+    auto frontend_firmware = Board::GetInstance().GetAudioFrontendFirmwareIdentity();
+    cJSON_AddStringToObject(root, "audioFrontendFirmware",
+                           frontend_firmware.empty() ? kAudioFrontendFirmware : frontend_firmware.c_str());
     cJSON_AddNumberToObject(root, "rssi", network_status.rssi);
     cJSON_AddNumberToObject(root, "wifiChannel", network_status.channel);
     cJSON_AddStringToObject(root, "localIp", network_status.ip.c_str());
@@ -1642,26 +1646,60 @@ bool VoiceLabClient::InitializeArchive() {
     return archive_.Initialize(storage_path, [this](const std::string& method,
                                                     const std::string& path,
                                                     const std::string& body, bool binary) {
-        if (!IsConnected() || !Board::GetInstance().IsNetworkConnected())
+        std::unique_lock<std::mutex> http_lock(archive_http_mutex_, std::try_to_lock);
+        if (!http_lock.owns_lock())
             return std::string{};
-        auto http = Board::GetInstance().GetNetwork()->CreateHttp(4);
+        if (!IsConnected() || !Board::GetInstance().IsNetworkConnected()) {
+            archive_http_.reset();
+            return std::string{};
+        }
+        // Check every request, including every chunk of an old recording.
+        // Never wait for archive HTTP while holding capture/media locks.
+        if (!VoiceLabMediaPolicy::CanUploadArchive(recording_.load(), tail_pending_.load()))
+            return std::string{};
+        // Startup still needs its small manifest registration before capture.
+        const auto state = user_state_.load();
+        if ((state == UserState::Starting || state == UserState::Requesting) &&
+            (binary || method != "PUT"))
+            return std::string{};
+        const auto endpoint = BuildHttpUrl("/api/v1/devices/" + GetDeviceKey() + "/offline-audio");
+        if (!archive_http_ || archive_http_endpoint_ != endpoint) {
+            archive_http_.reset();
+            archive_http_ = Board::GetInstance().GetNetwork()->CreateHttp(4);
+            archive_http_endpoint_ = endpoint;
+        }
+        auto* http = archive_http_.get();
+        if (!http)
+            return std::string{};
+        http->SetKeepAlive(true);
         http->SetTimeout(3000);
         http->SetHeader("X-Device-Token", GetDeviceToken());
         http->SetHeader("Content-Type", binary ? "application/octet-stream" : "application/json");
         http->SetContent(std::string(body));
-        const auto url =
-            BuildHttpUrl("/api/v1/devices/" + GetDeviceKey() + "/offline-audio" + path);
+        const auto url = endpoint + path;
         if (!http->Open(method, url)) {
+            archive_http_.reset();
             ESP_LOGW(TAG, "Archive HTTP open failed: %s %s", method.c_str(), path.c_str());
             return std::string{};
         }
         const auto code = http->GetStatusCode();
         auto result = code > 0 ? http->ReadAll() : std::string{};
-        http->Close();
+        if (code != 200 || result.empty())
+            archive_http_.reset();
         if (code != 200)
             ESP_LOGW(TAG, "Archive HTTP failed: status=%d path=%s response=%.200s", code,
                      path.c_str(), result.c_str());
         return code == 200 ? result : std::string{};
+    });
+}
+
+bool VoiceLabClient::MaintainRecordingStorage(const std::function<bool()>& maintenance) {
+    return archive_.MaintainStorage([this, &maintenance]() -> int {
+        const auto state = user_state_.load();
+        if (recording_ || tail_pending_ || state == UserState::Starting ||
+            state == UserState::Requesting || state == UserState::Stopping)
+            return -1;
+        return maintenance() ? 1 : 0;
     });
 }
 
@@ -1806,12 +1844,17 @@ bool VoiceLabClient::StartAuthorizedRecording(const std::string& recording_id,
     if (!storage_path.empty()) {
         const bool initialized = InitializeArchive();
         archive_sample_start_ = sample_start_;
-        if (!initialized || !archive_.Begin(recording_id_, boot_id_, sample_start_)) {
+        const bool started = initialized && archive_.Begin(recording_id_, boot_id_, sample_start_);
+        if (!started && initialized && !archive_.StorageUnavailable()) {
+            // Registration/identity failure is not permission to bypass archive admission.
             SetUserState(UserState::Error);
             return false;
         }
-        archive_recording_.store(true);
+        archive_recording_.store(started);
     }
+    local_backup_unavailable_.store(!archive_recording_.load());
+    if (local_backup_unavailable_.load())
+        ESP_LOGW(TAG, "Local storage unavailable; realtime recording without local backup");
     first_pcm_received_.store(false);
     bool opened = false;
     {
@@ -2078,6 +2121,8 @@ void VoiceLabClient::PumpMedia() {
         }
     }
     if (archive_recording_.load() && archive_.Failed()) {
+        local_backup_unavailable_.store(true);
+        ESP_LOGE(TAG, "Local recording failed; stopping capture with explicit storage error");
         AbortRecording();
         return;
     }
@@ -2134,6 +2179,9 @@ void VoiceLabClient::PumpMediaLocked(bool draining) {
                  stalled ? "ack_timeout" : "disconnected",
                  static_cast<unsigned long long>(acknowledged_sample_end_.load()),
                  static_cast<unsigned long long>(sent_sample_end_.load()));
+        ESP_LOGW(TAG, "Media reconnect evidence: ack_age_ms=%lld retained_packets=%u accepted=%d",
+                 static_cast<long long>((esp_timer_get_time() - last_ack_progress_us_.load()) / 1000),
+                 static_cast<unsigned>(unacknowledged_audio_.size()), audio_accepted_.load());
         audio_connected_.store(false);
         audio_accepted_.store(false);
         // Dispose locally, without a blocking graceful close on a broken link.

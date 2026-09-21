@@ -8,7 +8,8 @@
 
 Es8311AudioCodec::Es8311AudioCodec(void* i2c_master_handle, i2c_port_t i2c_port, int input_sample_rate, int output_sample_rate,
     gpio_num_t mclk, gpio_num_t bclk, gpio_num_t ws, gpio_num_t dout, gpio_num_t din,
-    gpio_num_t pa_pin, uint8_t es8311_addr, bool use_mclk, bool pa_inverted) {
+    gpio_num_t pa_pin, uint8_t es8311_addr, bool use_mclk, bool pa_inverted, int i2s_port) {
+    i2s_port_ = i2s_port;
     duplex_ = true; // 是否双工
     input_reference_ = false; // 是否使用参考输入，实现回声消除
     input_channels_ = 1; // 输入通道数
@@ -23,7 +24,7 @@ Es8311AudioCodec::Es8311AudioCodec(void* i2c_master_handle, i2c_port_t i2c_port,
 
     // Do initialize of related interface: data_if, ctrl_if and gpio_if
     audio_codec_i2s_cfg_t i2s_cfg = {
-        .port = I2S_NUM_0,
+        .port = static_cast<uint8_t>(i2s_port_),
         .rx_handle = rx_handle_,
         .tx_handle = tx_handle_,
     };
@@ -116,7 +117,7 @@ void Es8311AudioCodec::CreateDuplexChannels(gpio_num_t mclk, gpio_num_t bclk, gp
     assert(input_sample_rate_ == output_sample_rate_);
 
     i2s_chan_config_t chan_cfg = {
-        .id = I2S_NUM_0,
+        .id = XIAOZHI_I2S_PORT(i2s_port_),
         .role = I2S_ROLE_MASTER,
         .dma_desc_num = AUDIO_CODEC_DMA_DESC_NUM,
         .dma_frame_num = AUDIO_CODEC_DMA_FRAME_NUM,

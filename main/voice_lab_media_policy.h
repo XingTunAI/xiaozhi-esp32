@@ -9,6 +9,11 @@ struct VoiceLabMediaPolicy {
     static constexpr size_t kBatchFrames = 25;
     static constexpr uint64_t kWindowSamples = 16000 * 4;
 
+    // Archive traffic is deferred until capture and realtime tail draining end.
+    static constexpr bool CanUploadArchive(bool recording, bool tail_pending) {
+        return !recording && !tail_pending;
+    }
+
     static constexpr bool CanPump(bool draining, bool recording, bool tail_pending,
                                   bool interrupted) {
         return draining ? tail_pending && !interrupted : recording;

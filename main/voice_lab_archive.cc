@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <cstdio>
+#include <cerrno>
 #include <cstring>
 #include <new>
 
@@ -90,6 +91,14 @@ std::string ChunkName(unsigned sequence) {
 }  // namespace
 
 bool VoiceLabArchive::Initialize(const std::string& root, Upload upload) {
+    {
+        std::lock_guard<std::mutex> lock(operation_);
+        if (queue_)
+            return true;
+    }
+    std::shared_lock<std::shared_mutex> storage(storage_io_, std::try_to_lock);
+    if (!storage.owns_lock() || maintenance_pending_)
+        return false;
     std::lock_guard<std::mutex> lock(operation_);
     if (queue_)
         return true;
@@ -152,12 +161,18 @@ bool VoiceLabArchive::Initialize(const std::string& root, Upload upload) {
 }
 
 bool VoiceLabArchive::Begin(const std::string& run, uint64_t boot, uint64_t sample_start) {
+    std::shared_lock<std::shared_mutex> storage(storage_io_, std::try_to_lock);
+    if (!storage.owns_lock() || maintenance_pending_)
+        return false;
     std::lock_guard<std::mutex> lock(operation_);
     if (!queue_ || active_ || !SafeId(run))
         return false;
+    storage_unavailable_ = false;
     directory_ = root_ + "/" + run;
-    if (mkdir(directory_.c_str(), 0770) != 0)
+    if (mkdir(directory_.c_str(), 0770) != 0) {
+        storage_unavailable_ = errno != EEXIST;
         return false;  // Never overwrite an older task.
+    }
     run_ = run;
     boot_ = std::to_string(boot);
     sample_start_ = sample_start;
@@ -167,8 +182,10 @@ bool VoiceLabArchive::Begin(const std::string& run, uint64_t boot, uint64_t samp
     failed_ = false;
     manual_ = false;
     finishing_ = false;
-    if (!SaveManifest(false, false))
+    if (!SaveManifest(false, false)) {
+        storage_unavailable_ = true;
         return false;
+    }
     bool registered = false;
     for (unsigned attempt = 0; attempt < 3 && !registered; ++attempt) {
         const auto registration =
@@ -249,6 +266,7 @@ void VoiceLabArchive::WriteLoop() {
                 segment_.push_back(sample);
                 if (segment_.size() == kSegmentSamples && !Seal()) {
                     failed_ = true;
+                    storage_unavailable_ = true;
                     segment_.clear();
                     break;
                 }
@@ -278,10 +296,21 @@ bool VoiceLabArchive::Finish(bool interrupted) {
 
 void VoiceLabArchive::UploadLoop() {
     while (true) {
+        std::shared_lock<std::shared_mutex> storage(storage_io_, std::try_to_lock);
+        if (!storage.owns_lock() || storage_unavailable_ || maintenance_pending_) {
+            if (storage.owns_lock())
+                storage.unlock();
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            continue;
+        }
         bool transferred = false;
         DIR* dir = opendir(root_.c_str());
+        if (!dir)
+            storage_unavailable_ = true;
         if (dir) {
             while (auto* entry = readdir(dir)) {
+                if (maintenance_pending_)
+                    break;
                 std::string run = entry->d_name;
                 if (!SafeId(run))
                     continue;
@@ -313,6 +342,8 @@ void VoiceLabArchive::UploadLoop() {
                 cJSON* status = cJSON_Parse(response.c_str());
                 if (!status)
                     continue;
+                const bool empty =
+                    cJSON_IsTrue(cJSON_GetObjectItem(status, "empty")) && local_bytes == 0;
                 const bool complete = cJSON_IsTrue(cJSON_GetObjectItem(status, "complete"));
                 const bool manual = cJSON_IsTrue(cJSON_GetObjectItem(status, "manualRecovery"));
                 const bool requested = cJSON_IsTrue(cJSON_GetObjectItem(status, "requested"));
@@ -321,7 +352,7 @@ void VoiceLabArchive::UploadLoop() {
                 const uint64_t captured_bytes =
                     cJSON_IsNumber(captured) ? captured->valuedouble * 2 : 0;
                 cJSON_Delete(status);
-                if (complete) {
+                if (complete || (empty && stopped && captured_bytes == 0)) {
                     if (Write(folder + "/synced.json", response.data(), response.size())) {
                         std::lock_guard<std::mutex> lock(operation_);
                         if (run == run_ && !active_)
@@ -337,6 +368,8 @@ void VoiceLabArchive::UploadLoop() {
                 if (!chunks)
                     continue;
                 while (auto* chunk = readdir(chunks)) {
+                    if (maintenance_pending_)
+                        break;
                     std::string name = chunk->d_name;
                     if (name.size() != 14 || name.substr(10) != ".pcm" ||
                         name.substr(0, 10).find_first_not_of("0123456789") != std::string::npos)
@@ -379,11 +412,32 @@ void VoiceLabArchive::UploadLoop() {
                         break;
                 }
                 closedir(chunks);
-                if (stopped && !pending)
+                if (stopped && !pending && !maintenance_pending_)
                     upload_("POST", "/" + run + "/complete", "{}", false);
             }
             closedir(dir);
         }
+        storage.unlock();
         vTaskDelay(pdMS_TO_TICKS(transferred ? 50 : 2000));
     }
+}
+
+bool VoiceLabArchive::MaintainStorage(const std::function<int()>& maintenance) {
+    if (maintenance_pending_.exchange(true))
+        return false;
+    struct ResetPending {
+        std::atomic<bool>& flag;
+        ~ResetPending() { flag.store(false); }
+    } reset{maintenance_pending_};
+    if (active_ || finishing_)
+        return false;
+    std::unique_lock<std::shared_mutex> storage(storage_io_, std::defer_lock);
+    for (unsigned attempt = 0; attempt < 500 && !storage.try_lock(); ++attempt)
+        vTaskDelay(pdMS_TO_TICKS(10));
+    if (!storage.owns_lock() || active_ || finishing_)
+        return false;
+    const int ready = maintenance();  // -1: declined; 0: failed; 1: mounted.
+    if (ready >= 0)
+        storage_unavailable_ = ready == 0;
+    return ready > 0;
 }

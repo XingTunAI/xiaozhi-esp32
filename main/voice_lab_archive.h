@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -21,8 +22,11 @@ public:
     void RequireManualRecovery() { manual_.store(true); }
     bool Active() const { return active_.load(); }
     bool Failed() const { return failed_.load(); }
+    bool StorageUnavailable() const { return storage_unavailable_.load(); }
     uint64_t Samples() const { return samples_.load(); }
     bool ManualRecovery() const { return manual_.load(); }
+    // Quiesce directory/file users before the board changes the mount.
+    bool MaintainStorage(const std::function<int()>& maintenance);
 
 private:
     void WriteLoop();
@@ -36,7 +40,10 @@ private:
     QueueHandle_t queue_ = nullptr;
     Upload upload_;
     std::mutex operation_;
+    std::shared_mutex storage_io_;
+    std::atomic<bool> maintenance_pending_{false};
     std::atomic<bool> active_{false}, failed_{false}, manual_{false};
+    std::atomic<bool> storage_unavailable_{false};
     std::atomic<bool> finishing_{false}, finish_interrupted_{false};
     std::atomic<uint64_t> samples_{0};
 };

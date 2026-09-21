@@ -47,7 +47,7 @@ bool HttpClient::IsConnectionReusable(const std::string& host, int port) const {
     // 3. 没有连接错误
     // 4. 上一次响应支持 Keep-Alive
     // 5. 上一次请求已完成（数据已接收完整）
-    return connected_ && 
+    return keep_alive_ && connected_ &&
            host_ == host && 
            port_ == port && 
            !connection_error_ &&
@@ -172,14 +172,18 @@ std::string HttpClient::BuildHttpRequest() {
 bool HttpClient::Open(const std::string& method, const std::string& url) {
     method_ = method;
     url_ = url;
-    
+
+    const auto previous_host = host_;
+    const auto previous_port = port_;
+    const auto previous_protocol = protocol_;
     if (!ParseUrl(url)) {
         return false;
     }
 
     // 检查是否可以复用现有连接
-    bool can_reuse = IsConnectionReusable(host_, port_);
-    
+    bool can_reuse = previous_host == host_ && previous_port == port_ &&
+                     previous_protocol == protocol_ && IsConnectionReusable(host_, port_);
+
     uint32_t t_connect = xTaskGetTickCount() * portTICK_PERIOD_MS;
     if (can_reuse) {
         ESP_LOGI(TAG, "Reusing existing connection to %s:%d", host_.c_str(), port_);
@@ -325,16 +329,16 @@ void HttpClient::ProcessReceivedData() {
                     auto conn_it = response_headers_.find("connection");
                     if (conn_it != response_headers_.end()) {
                         std::string conn_value = conn_it->second.value;
-                        std::transform(conn_value.begin(), conn_value.end(), conn_value.begin(), ::tolower);
-                        if (conn_value.find("keep-alive") != std::string::npos) {
-                            server_keep_alive_ = true;
-                            ESP_LOGD(TAG, "Server supports Keep-Alive");
-                        } else if (conn_value.find("close") != std::string::npos) {
+                        std::transform(conn_value.begin(), conn_value.end(), conn_value.begin(),
+                                       ::tolower);
+                        // close always wins, including a mixed token list.
+                        if (conn_value.find("close") != std::string::npos) {
                             server_keep_alive_ = false;
-                            ESP_LOGD(TAG, "Server will close connection");
+                        } else if (conn_value.find("keep-alive") != std::string::npos) {
+                            server_keep_alive_ = true;
                         }
                     }
-                    
+
                     // 检查是否为 chunked 编码
                     auto it = response_headers_.find("transfer-encoding");
                     if (it != response_headers_.end() &&
@@ -468,6 +472,7 @@ bool HttpClient::ParseStatusLine(const std::string& line) {
         return false;
     }
 
+    server_keep_alive_ = version == "HTTP/1.1";
     status_code_ = static_cast<int>(status);
     ESP_LOGD(TAG, "HTTP status code: %d", status_code_);
     return true;
@@ -774,9 +779,10 @@ bool HttpClient::IsDataComplete() const {
         return total_body_received_ >= content_length_;
     }
 
-    // 如果没有content-length且不是chunked，当连接关闭时认为完整
-    // 这种情况通常用于HTTP/1.0或者content-length为0的响应
-    return true;
+    // Zero-length and bodyless responses have a known boundary. A body
+    // delimited by connection close must never reuse a still-open socket.
+    return headers_received_ && (response_headers_.count("content-length") != 0 ||
+                                 method_ == "HEAD" || status_code_ == 204 || status_code_ == 304);
 }
 
 int HttpClient::GetLastError() {

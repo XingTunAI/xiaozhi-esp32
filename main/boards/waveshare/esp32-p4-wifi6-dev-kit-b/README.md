@@ -1,5 +1,9 @@
 # ESP32-P4-WIFI6-DEV-KIT-B 屏幕适配
 
+2026-09-21：新增可选 BLE 连接探针，构建命令加 `--config config.ble.json --name esp32-p4x-wifi6-dev-kit-b-screen-ble`。通过已有 C6/SDIO 暴露设备信息读取和 Ping/Pong 服务，对应工作区 `counter-miniapp/` 微信小程序。标准变体默认关闭，不包含屏幕修改或录音控制指令。当前构建与验证边界见 [USB 基线](../../../../docs/2026-09-21-p4-usb-baseline.md)；微信真机连接尚未验收。
+
+2026-09-21：当前使用 USB 声卡采集、ES8311 播放。双麦音质未达标，暂停支持；已移除音源切换、L/R、AFE 和增益按钮，保留诊断源码。历史实现及验收边界见 [双麦迁移记录](../../../../docs/2026-09-21-p4-dual-mic-source.md)。
+
 目标为 PCB Rev1.2、P4 revision 3.1、16MB Flash / 32MB PSRAM，以及配套的 7-DSI-TOUCH-A（ILI9881C，720×1280）。此板型与一体式 P4 Touch LCD 7 不同，不可互刷。
 
 唯一变体 `esp32-p4x-wifi6-dev-kit-b-screen` 复用小智应用和 MipiLcdDisplay，实现横屏 1280×720 原生 LVGL 柜台演示。客户首页为单页信息展示，保留金价、商品克重、费用明细和合计；无导航、订单确认或录音操作按钮。所有价格均为演示数据，不创建订单、不支付。ES8311 探测成功后复用小智音频驱动，缺失则回退 DummyAudioCodec 保留界面；不自动录音。GT9xx 触摸自动探测 0x5d/0x14。当前 StartNetwork 会把有线/Wi-Fi 的 IP 可用状态交给现有 Voice Lab 客户端，使用独立设备标识和 HTTPS/WSS 配对；不启动小智 OTA。USB UAC2 阵列提供采集，板载 ES8311 保留提示音播放。最新接入状态见 [WEBSOCKET-INTEGRATION.md](WEBSOCKET-INTEGRATION.md)。

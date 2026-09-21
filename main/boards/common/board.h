@@ -81,6 +81,8 @@ public:
     virtual Camera* GetCamera();
     virtual NetworkInterface* GetNetwork() = 0;
     virtual std::string GetRecordingStoragePath() const { return {}; }
+    virtual std::string GetAudioFrontendIdentity() const { return {}; }
+    virtual std::string GetAudioFrontendFirmwareIdentity() const { return {}; }
     virtual bool IsNetworkConnected() const { return false; }
     virtual BoardNetworkStatus GetBoardNetworkStatus() const { return {}; }
     // Optional physical-console maintenance command, implemented by the board.
