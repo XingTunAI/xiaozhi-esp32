@@ -32,3 +32,9 @@ bool IsBoardNetworkConnected();
 bool ReadBoardUsbAudio(int16_t* samples, int count);
 void StopBoardUsbAudio();
 bool RequestBoardC6Update(const std::string& url);
+
+// K01 uses GPIO26/27 for I2C. The dual-USB layout swaps USB Serial/JTAG onto FSLS PHY 1,
+// which owns GPIO26/27, so the USB layout is fixed at boot from NVS p4_audio/source:
+// K01 -> HS USB-A only (FS H2 off, USJ stays on GPIO24/25); otherwise HS + FS H2.
+// Latched on first call (after NVS init); switching to or from K01 needs a reboot.
+bool BoardUsbLayoutForK01();

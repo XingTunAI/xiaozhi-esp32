@@ -265,7 +265,9 @@ void CounterUi::UpdateSettings() {
                     (VoiceLabClient::GetInstance().IsConnected() ? "online" : "offline") +
                     "\nCapture: " +
                     (VoiceLabClient::GetInstance().IsRecording() ? "recording" : "idle") +
-                    "\n下次录音：" + (BoardPdmSelected() ? BoardPdmModeName() : "USB 声卡") +
+                    "\n下次录音：" +
+                    (board_audio_source.load() == kBoardSourceUsb ? "USB 声卡"
+                                                                  : BoardAudioSourceName()) +
                     "    Playback: ES8311");
     }
 }

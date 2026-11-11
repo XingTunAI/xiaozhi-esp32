@@ -22,6 +22,7 @@
 #include <esp_lvgl_port.h>
 #include <esp_system.h>
 #include <esp_wifi.h>
+#include <cstdlib>
 
 namespace {
 constexpr char TAG[] = "DevKitBScreen";
@@ -50,14 +51,21 @@ public:
     WaveshareDevKitBScreen() {
         ESP_LOGI(TAG, "Boot reset reason=%d", static_cast<int>(esp_reset_reason()));
         InitializeI2c();
-        InitializeScreenControl();
-        InitializeDisplay();
-        backlight_ = new ScreenBacklight(screen_control_);
-        backlight_->SetBrightness(80);
-        InitializeTouch();
+        // The 7-DSI-TOUCH-A is optional: lab capture (e.g. K01 in a meeting room) runs headless.
+        // Without it the board keeps the base NoDisplay; recording is driven by the server.
+        if (i2c_master_probe(i2c_bus_, DISPLAY_CONTROL_I2C_ADDRESS, 100) == ESP_OK) {
+            InitializeScreenControl();
+            InitializeDisplay();
+            backlight_ = new ScreenBacklight(screen_control_);
+            backlight_->SetBrightness(80);
+            InitializeTouch();
+        } else {
+            ESP_LOGW(TAG, "Screen controller 0x%02x not found; running headless",
+                     DISPLAY_CONTROL_I2C_ADDRESS);
+        }
     }
 
-    Display* GetDisplay() override { return display_; }
+    Display* GetDisplay() override { return display_ ? display_ : WifiBoard::GetDisplay(); }
     Backlight* GetBacklight() override { return backlight_; }
 
     AudioCodec* GetAudioCodec() override {
@@ -92,12 +100,25 @@ public:
         return status.storage.find("已挂载") == 0 ? "/sdcard" : "";
     }
     bool IsNetworkConnected() const override { return IsBoardNetworkConnected(); }
-    std::string GetAudioFrontendIdentity() const override { return "p4-pdm-usb-selectable"; }
-    std::string GetAudioFrontendFirmwareIdentity() const override { return "p4-mm-afe-usb-v1"; }
+    // Supported combination, not the source of a given recording (that is latched per
+    // recording and logged as "Next recording input" / "K01 capture started").
+    std::string GetAudioFrontendIdentity() const override { return "p4-usb-pdm-k01-selectable"; }
+    std::string GetAudioFrontendFirmwareIdentity() const override { return "p4-mm-afe-usb-k01raw-v1"; }
 
     bool HandleConsoleCommand(const std::string& command) override {
         if (HandleBoardScaleCommand(command))
             return true;
+        // Page/button commands drive CounterDisplay and are unavailable when running headless.
+        if (!display_) {
+            for (const char* screen_command : {"p4 employee", "p4 ui-freeze", "p4 ui-resume",
+                                               "p4 account-page", "p4 binding-button",
+                                               "p4 record-button"}) {
+                if (command == screen_command) {
+                    ESP_LOGW(TAG, "No screen attached: '%s' unavailable", screen_command);
+                    return true;
+                }
+            }
+        }
         if (command == "p4 employee") {
             static_cast<CounterDisplay*>(display_)->ShowEmployeePage();
             ESP_LOGI(TAG, "Employee device page opened");
@@ -118,13 +139,13 @@ public:
             ESP_LOGI(TAG, "Next recording input: %s", BoardPdmModeName());
             return true;
         }
+        if (HandleK01Command(command))
+            return true;
         if (command == "p4 audio pdm" || command == "p4 audio usb" ||
             command == "p4 audio status") {
             if (command != "p4 audio status")
                 SelectBoardPdm(command == "p4 audio pdm");
-            ESP_LOGI(TAG, "Next recording input: %s",
-                     BoardPdmSelected() ? BoardPdmModeName() : "USB");
-            ESP_LOGI(TAG, "Next raw PDM gain: x%d (USB/AFE unchanged)", board_pdm_gain.load());
+            LogAudioSelection();
             return true;
         }
         if (command == "p4 ui-freeze" || command == "p4 ui-resume") {
@@ -202,6 +223,51 @@ private:
     esp_lcd_panel_io_handle_t touch_io_ = nullptr;
     esp_lcd_touch_handle_t touch_ = nullptr;
     AudioCodec* codec_ = nullptr;
+
+    static void LogAudioSelection() {
+        ESP_LOGI(TAG, "Next recording input: %s", BoardAudioSourceName());
+        ESP_LOGI(TAG, "Next raw PDM gain: x%d (USB/AFE unchanged)", board_pdm_gain.load());
+        const int tenths = board_k01_gain.load();
+        ESP_LOGI(TAG, "Next K01 channel: %s, PGA %d.%d dB", K01Capture::ModeName(board_k01_mode.load()),
+                 tenths / 10, tenths % 10);
+    }
+
+    // p4 audio k01            select K01 for the next recording (channel/gain unchanged)
+    // p4 audio k01 mic <1-4>  one raw microphone; also selects K01
+    // p4 audio k01 mean       mean of the four raw microphones; also selects K01
+    // p4 audio k01 gain <dB>  ES7210 PGA 0-37.5 dB, one decimal; does not change the source
+    static bool HandleK01Command(const std::string& command) {
+        const std::string prefix = "p4 audio k01";
+        if (command.compare(0, prefix.size(), prefix) != 0)
+            return false;
+        const std::string rest = command.substr(prefix.size());
+        bool ok = true;
+        if (rest.empty()) {
+            SelectBoardAudioSource(kBoardSourceK01);
+        } else if (rest == " mean") {
+            SelectBoardK01Mode(k01::kModeMean);
+            SelectBoardAudioSource(kBoardSourceK01);
+        } else if (rest.size() == 6 && rest.compare(0, 5, " mic ") == 0 && rest[5] >= '1' &&
+                   rest[5] <= '4') {
+            SelectBoardK01Mode(rest[5] - '0');
+            SelectBoardAudioSource(kBoardSourceK01);
+        } else if (rest.compare(0, 6, " gain ") == 0) {
+            char* end = nullptr;
+            const float db = strtof(rest.c_str() + 6, &end);
+            const int tenths = static_cast<int>(db * 10.0f + (db >= 0 ? 0.5f : -0.5f));
+            ok = end != rest.c_str() + 6 && *end == '\0' && k01::ValidGain(tenths);
+            if (ok)
+                SelectBoardK01Gain(tenths);
+        } else {
+            ok = false;
+        }
+        if (!ok) {
+            ESP_LOGW(TAG, "Usage: p4 audio k01 [mic 1-4 | mean | gain 0-37.5]");
+            return true;
+        }
+        LogAudioSelection();
+        return true;
+    }
 
     void InitializeI2c() {
         i2c_master_bus_config_t config = {};

@@ -1,6 +1,7 @@
 #include "board_peripherals.h"
 #include "c6_update.h"
 #include "voice_lab_client.h"
+#include "settings.h"
 
 #include <driver/gpio.h>
 #include <driver/sdmmc_host.h>
@@ -532,24 +533,32 @@ esp_err_t StartUsbAudio() {
              static_cast<unsigned>(
                  heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA)),
              static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
+    const bool k01_layout = BoardUsbLayoutForK01();
     usb_host_config_t host = {};
     host.intr_flags = ESP_INTR_FLAG_LEVEL1;
-    host.peripheral_map = BIT0 | BIT1;
+    host.peripheral_map = k01_layout ? BIT0 : (BIT0 | BIT1);
     auto err = usb_host_install(&host);
     if (err != ESP_OK)
         return err;
-    // H2 uses FSLS PHY 0 (GPIO24 D-, GPIO25 D+). Keep the HS USB-A
-    // controller enabled; route FS OTG to H2 in software, without eFuse writes.
-    // Apply after the host library initializes both PHYs, before servicing events.
-    usb_wrap_ll_phy_select(&USB_WRAP, 0);
-    err = gpio_set_drive_capability(GPIO_NUM_24, GPIO_DRIVE_CAP_3);
-    if (err == ESP_OK)
-        err = gpio_set_drive_capability(GPIO_NUM_25, GPIO_DRIVE_CAP_3);
-    if (err != ESP_OK) {
-        usb_host_uninstall();
-        return err;
+    if (k01_layout) {
+        // Keep the default PHY mapping: USB Serial/JTAG on FSLS PHY 0 (GPIO24/25) and
+        // FS OTG not installed, so GPIO26/27 stay plain GPIO for the K01 I2C bus.
+        ESP_LOGI(TAG, "USB host: HS USB-A only; FS H2 off because K01 uses GPIO26/27");
+    } else {
+        // H2 uses FSLS PHY 0 (GPIO24 D-, GPIO25 D+). Keep the HS USB-A
+        // controller enabled; route FS OTG to H2 in software, without eFuse writes.
+        // Apply after the host library initializes both PHYs, before servicing events.
+        // USB Serial/JTAG then moves to FSLS PHY 1, which owns GPIO26/27.
+        usb_wrap_ll_phy_select(&USB_WRAP, 0);
+        err = gpio_set_drive_capability(GPIO_NUM_24, GPIO_DRIVE_CAP_3);
+        if (err == ESP_OK)
+            err = gpio_set_drive_capability(GPIO_NUM_25, GPIO_DRIVE_CAP_3);
+        if (err != ESP_OK) {
+            usb_host_uninstall();
+            return err;
+        }
+        ESP_LOGI(TAG, "USB dual host: HS USB-A + FS H2 (GPIO24 D-, GPIO25 D+)");
     }
-    ESP_LOGI(TAG, "USB dual host: HS USB-A + FS H2 (GPIO24 D-, GPIO25 D+)");
     if (xTaskCreate(UsbEvents, "usb_events", 4096, nullptr, 5, nullptr) != pdPASS) {
         usb_host_uninstall();
         return ESP_ERR_NO_MEM;
@@ -822,6 +831,15 @@ bool RequestBoardC6Update(const std::string& url) {
 bool IsBoardNetworkConnected() {
     std::lock_guard<std::mutex> lock(status_mutex);
     return network_connected;
+}
+
+bool BoardUsbLayoutForK01() {
+    // 2 == kBoardSourceK01 (usb_capture_codec.h). First call happens after NVS init.
+    static const bool k01 = [] {
+        Settings settings("p4_audio");
+        return settings.GetInt("source", 0) == 2;
+    }();
+    return k01;
 }
 
 void StopBoardUsbAudio() {
