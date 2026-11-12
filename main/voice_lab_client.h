@@ -65,12 +65,18 @@ public:
     bool StopRecording();
     bool RequestPlayback(const std::string& url);
     void StopPlayback();
-    bool SendPcmAudio(std::vector<int16_t>&& pcm);
+    // `pcm` is interleaved with `channels` channels. A mono recording takes channel 0.
+    bool SendPcmAudio(std::vector<int16_t>&& pcm, int channels = 1);
     std::string GetStatusJson() const;
 
 private:
     static constexpr int kAudioSampleRate = 16000;
-    static constexpr int kAudioChannels = 1;
+    static constexpr int kAudioChannels = 1;  // Default; a capture plan may request 4.
+    // Channels uploaded for the current recording (1, or 4 = K01 MIC1..MIC4 raw evidence).
+    // Written only while capture is stopped, before the recording starts.
+    std::atomic<int> recording_channels_{kAudioChannels};
+    // 1 or 4 for a supported plan, -1 for one this firmware cannot honour.
+    static int CapturePlanChannels(const cJSON* capture_plan);
     static constexpr int kAudioFrameDurationMs = 20;
     static constexpr int kPcmSamplesPerFrame = kAudioSampleRate * kAudioFrameDurationMs / 1000;
     static constexpr int kMaxFramesPerPacket = VoiceLabMediaPolicy::kBatchFrames;

@@ -22,6 +22,9 @@ inline std::atomic<int> board_pdm_mode{0};
 inline std::atomic<int> board_pdm_gain{1};
 inline std::atomic<int> board_k01_mode{1};
 inline std::atomic<int> board_k01_gain{k01::kDefaultGainTenths};
+// Channels requested by the Voice Lab capture plan for the next recording: 1, or 4 for K01
+// raw evidence (MIC1..MIC4 interleaved). Set by the board before capture starts.
+inline std::atomic<int> board_capture_channels{1};
 inline void SelectBoardPdmGain(int gain) {
     if (!PdmPcmGain::Valid(gain))
         return;
@@ -128,7 +131,7 @@ public:
                     vTaskDelay(pdMS_TO_TICKS(100));
                     return false;
                 }
-                return k01_.Fetch(data.data(), data.size());
+                return k01_.Fetch(data.data(), data.size() / input_channels_, input_channels_);
             default:
                 return ReadBoardUsbAudio(data.data(), data.size());
         }
@@ -141,6 +144,15 @@ public:
         pdm_gain_ = board_pdm_gain.load();
         k01_mode_ = board_k01_mode.load();
         k01_gain_ = board_k01_gain.load();
+        // Four raw channels exist only on K01; every other source stays mono. Latched here,
+        // at the recording boundary, so a frame never changes width mid-stream.
+        const int channels = board_capture_channels.load();
+        input_channels_ = source_ == kBoardSourceK01 && channels == 4 ? 4 : 1;
+        if (input_channels_ != channels)
+            ESP_LOGW("P4Audio", "Capture plan wants %d channels; source provides %d", channels,
+                     input_channels_);
+        else if (input_channels_ == 4)
+            ESP_LOGI("P4Audio", "Capture channels: 4 (K01 MIC1..MIC4 raw evidence)");
     }
     void EnableInput(bool enable) override {
         std::lock_guard<std::mutex> lock(capture_mutex_);
@@ -178,6 +190,8 @@ private:
         StopBoardUsbAudio();
         pdm_.Stop();
         k01_.Stop();
+        // Wake word / voice processing read input_channels(); never leave them at 4.
+        input_channels_ = 1;
     }
     std::unique_ptr<AudioCodec> playback_;
 };

@@ -103,7 +103,17 @@ public:
     // Supported combination, not the source of a given recording (that is latched per
     // recording and logged as "Next recording input" / "K01 capture started").
     std::string GetAudioFrontendIdentity() const override { return "p4-usb-pdm-k01-selectable"; }
-    std::string GetAudioFrontendFirmwareIdentity() const override { return "p4-mm-afe-usb-k01raw-v1"; }
+    std::string GetAudioFrontendFirmwareIdentity() const override { return "p4-mm-afe-usb-k01raw-v2"; }
+    // Only the K01 source has four synchronised raw microphones to offer.
+    int GetVoiceLabEvidenceChannels() const override {
+        return board_audio_source.load() == kBoardSourceK01 ? 4 : 1;
+    }
+    bool SetVoiceLabCaptureChannels(int channels) override {
+        if (channels != 1 && channels != GetVoiceLabEvidenceChannels())
+            return false;
+        board_capture_channels.store(channels);
+        return true;
+    }
 
     bool HandleConsoleCommand(const std::string& command) override {
         if (HandleBoardScaleCommand(command))

@@ -83,6 +83,13 @@ public:
     virtual std::string GetRecordingStoragePath() const { return {}; }
     virtual std::string GetAudioFrontendIdentity() const { return {}; }
     virtual std::string GetAudioFrontendFirmwareIdentity() const { return {}; }
+    // Voice Lab raw multi-microphone evidence. 1 = mono only (default). A board
+    // returning 4 can upload its four raw microphones interleaved in physical
+    // MIC1..MIC4 order (capture plan layout "k01_mic_1_4").
+    virtual int GetVoiceLabEvidenceChannels() const { return 1; }
+    // Latched by the capture source at the next recording boundary. Returns false
+    // when the board cannot honour the requested channel count.
+    virtual bool SetVoiceLabCaptureChannels(int channels) { return channels == 1; }
     virtual bool IsNetworkConnected() const { return false; }
     virtual BoardNetworkStatus GetBoardNetworkStatus() const { return {}; }
     // Optional physical-console maintenance command, implemented by the board.

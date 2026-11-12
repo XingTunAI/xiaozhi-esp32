@@ -33,3 +33,11 @@ static_assert(k01::ValidMode(0) && k01::ValidMode(4) && !k01::ValidMode(-1) && !
 static_assert(k01::ValidGain(0) && k01::ValidGain(375) && !k01::ValidGain(376) && !k01::ValidGain(-1));
 static_assert(k01::ValidGain(k01::kDefaultGainTenths));
 static_assert(k01::kFrame * 1000 / k01::kRate == 20);
+
+// Four-channel evidence: one TDM4 frame becomes physical MIC1..MIC4 ("k01_mic_1_4").
+constexpr bool DeinterleaveIsPhysicalOrder() {
+    int16_t out[4] = {};
+    k01::Deinterleave(kFrame, out);
+    return out[0] == 11 && out[1] == 22 && out[2] == 33 && out[3] == 44;
+}
+static_assert(DeinterleaveIsPhysicalOrder());

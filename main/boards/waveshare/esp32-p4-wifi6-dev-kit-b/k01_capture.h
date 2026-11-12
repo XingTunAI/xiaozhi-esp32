@@ -19,8 +19,9 @@
 // copied from the probe that passed on 2026-11-04 (I2C IDs, 8 s TDM capture, 0 errors).
 //
 // Same contract as PdmCapture: owned by the board for its lifetime, Start() is latched per
-// recording, Fetch() returns exactly one 20 ms mono frame or false. Raw only: no AFE,
-// no digital gain, no automatic fallback to another source.
+// recording, Fetch() returns exactly one 20 ms frame or false: mono (the selected mic or the
+// mean), or all four mics interleaved in physical MIC1..MIC4 order for Voice Lab evidence.
+// Raw only: no AFE, no digital gain, no automatic fallback to another source.
 namespace k01 {
 constexpr i2c_port_t kI2cPort = I2C_NUM_0;  // board I2C1 (GPIO7/8) also has an ES8311 at 0x18
 constexpr gpio_num_t kSda = GPIO_NUM_26;
@@ -112,9 +113,10 @@ public:
         raw_bytes_ = 0;
     }
 
-    bool Fetch(int16_t* output, size_t count) {
+    // `count` is samples per channel; `channels` is 1 or 4.
+    bool Fetch(int16_t* output, size_t count, int channels = 1) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (!running_ || count != k01::kFrame)
+        if (!running_ || count != k01::kFrame || (channels != 1 && channels != k01::kSlots))
             return false;
         size_t bytes = 0;
         auto err = i2s_channel_read(rx_, reinterpret_cast<uint8_t*>(raw_.data()) + raw_bytes_,
@@ -135,7 +137,10 @@ public:
                 energy_[s] += static_cast<uint64_t>(v * v);
                 peak_[s] = std::max(peak_[s], v < 0 ? -v : v);
             }
-            output[i] = k01::Select(frame, mode_);
+            if (channels == 1)
+                output[i] = k01::Select(frame, mode_);
+            else
+                k01::Deinterleave(frame, &output[i * k01::kSlots]);
         }
         level_samples_ += count;
         if (level_samples_ >= k01::kRate) {

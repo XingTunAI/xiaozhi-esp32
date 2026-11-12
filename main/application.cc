@@ -109,8 +109,8 @@ void Application::Initialize() {
     callbacks.on_playback_progress = [this](uint32_t playback_id, uint32_t media_position_ms) {
         notify_player_.OnPlaybackProgress(playback_id, media_position_ms);
     };
-    callbacks.on_external_capture_audio = [](std::vector<int16_t>&& pcm) {
-        VoiceLabClient::GetInstance().SendPcmAudio(std::move(pcm));
+    callbacks.on_external_capture_audio = [](std::vector<int16_t>&& pcm, int channels) {
+        VoiceLabClient::GetInstance().SendPcmAudio(std::move(pcm), channels);
     };
     audio_service_.SetCallbacks(callbacks);
 

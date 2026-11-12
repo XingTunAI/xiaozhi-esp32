@@ -324,14 +324,7 @@ void AudioService::AudioInputTask() {
             bool read_ok = ReadAudioData(data, 16000, samples);
             if (read_ok) {
                 ++external_capture_read_ok;
-                if (codec_->input_channels() > 1) {
-                    auto channels = codec_->input_channels();
-                    auto mono_data = std::vector<int16_t>(data.size() / channels);
-                    for (size_t i = 0, j = 0; i < mono_data.size(); ++i, j += channels) {
-                        mono_data[i] = data[j];
-                    }
-                    data = std::move(mono_data);
-                }
+                const int channels = codec_->input_channels();
                 bool deliver_frame;
                 {
                     std::lock_guard<std::mutex> lock(external_capture_mutex_);
@@ -340,7 +333,7 @@ void AudioService::AudioInputTask() {
                     deliver_frame = capture_generation == external_capture_generation_;
                 }
                 if (deliver_frame && callbacks_.on_external_capture_audio) {
-                    callbacks_.on_external_capture_audio(std::move(data));
+                    callbacks_.on_external_capture_audio(std::move(data), channels);
                 } else if (deliver_frame) {
                     ++external_capture_callback_missing;
                 }

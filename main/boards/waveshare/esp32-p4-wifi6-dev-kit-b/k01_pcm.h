@@ -12,8 +12,8 @@ constexpr size_t kFrame = 320;  // 20 ms
 // Recording channel: 1..4 = one physical microphone, 0 = mean of all four.
 constexpr int kModeMean = 0;
 constexpr bool ValidMode(int mode) { return mode >= 0 && mode <= 4; }
-// ES7210 TDM emits MIC1, MIC3, MIC2, MIC4 (see main/audio/codecs/box_audio_codec.cc). Verify
-// with a tap test on each microphone before trusting the mapping for array geometry.
+// ES7210 TDM emits MIC1, MIC3, MIC2, MIC4 (see main/audio/codecs/box_audio_codec.cc).
+// Verified on C-401 on 2026-11-12: blowing into each port at PGA 0 dB raised only that mic, 19-33 dB.
 constexpr int kMicToSlot[5] = {-1, 0, 2, 1, 3};
 // ES7210 PGA range; stored in NVS as tenths of a dB.
 constexpr int kMinGainTenths = 0;
@@ -30,5 +30,10 @@ constexpr int16_t MixMean(const int16_t* frame) {
 // One mono sample from an interleaved TDM4 frame for the given mode.
 constexpr int16_t Select(const int16_t* frame, int mode) {
     return mode == kModeMean ? MixMean(frame) : frame[kMicToSlot[mode]];
+}
+// One TDM4 frame reordered to physical MIC1..MIC4 (Voice Lab layout "k01_mic_1_4").
+constexpr void Deinterleave(const int16_t* frame, int16_t* out) {
+    for (int mic = 1; mic <= kSlots; ++mic)
+        out[mic - 1] = frame[kMicToSlot[mic]];
 }
 }  // namespace k01

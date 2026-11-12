@@ -1394,6 +1394,8 @@ void VoiceLabClient::SendHelloLocked() {
     cJSON_AddItemToArray(control_capabilities, cJSON_CreateString("recording"));
     cJSON_AddItemToArray(control_capabilities, cJSON_CreateString("playback-url"));
     cJSON_AddItemToArray(control_capabilities, cJSON_CreateString(kAudioProtocol));
+    if (Board::GetInstance().GetVoiceLabEvidenceChannels() >= 4)
+        cJSON_AddItemToArray(control_capabilities, cJSON_CreateString("four-mic-evidence"));
     cJSON_AddItemToObject(root, "controlCapabilities", control_capabilities);
 
     cJSON* capabilities = cJSON_CreateObject();
@@ -1559,7 +1561,7 @@ bool VoiceLabClient::ApplyRecordingAuthorization(const cJSON* authorization,
 uint64_t VoiceLabClient::CaptureSampleEnd() {
     std::lock_guard<std::mutex> lock(media_mutex_);
     std::lock_guard<std::mutex> pcm_lock(pcm_mutex_);
-    return sample_start_ + pending_audio_pcm_.size() / kAudioChannels;
+    return sample_start_ + pending_audio_pcm_.size() / recording_channels_.load();
 }
 
 void VoiceLabClient::AppendRecordingIdentity(cJSON* root) const {
@@ -1746,6 +1748,16 @@ bool VoiceLabClient::StartAuthorizedRecording(const std::string& recording_id,
     };
     interrupted_.store(false);
     SetUserState(UserState::Starting);
+    // Capture is stopped here, so the channel count cannot change under a running stream.
+    const int channels = CapturePlanChannels(capture_plan);
+    if (channels < 0 || !Board::GetInstance().SetVoiceLabCaptureChannels(channels)) {
+        ESP_LOGW(TAG, "Capture plan rejected: channels=%d", channels);
+        SetUserState(UserState::Error);
+        return false;
+    }
+    recording_channels_.store(channels);
+    if (channels != kAudioChannels)
+        ESP_LOGI(TAG, "Recording uploads %d raw channels (k01_mic_1_4)", channels);
     if (cancelled() || !Application::GetInstance().PrepareVoiceLabCapture(6000) || cancelled()) {
         SetUserState(UserState::Error);
         return false;
@@ -1786,8 +1798,10 @@ bool VoiceLabClient::StartAuthorizedRecording(const std::string& recording_id,
 #else
             constexpr uint32_t pcm_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
 #endif
-            if (!pending_audio_pcm_.Allocate(kMaxPendingPcmFrames * kPcmSamplesPerFrame,
-                                             pcm_caps)) {
+            // Same 12 s duration budget per channel (4 channels: about 1.5 MB of PSRAM).
+            if (!pending_audio_pcm_.Allocate(
+                    kMaxPendingPcmFrames * kPcmSamplesPerFrame * recording_channels_.load(),
+                    pcm_caps)) {
                 ESP_LOGE(TAG, "Unable to allocate bounded PCM buffer; capture remains disabled");
                 CloseAudioLocked();
                 SetUserState(UserState::Error);
@@ -1841,7 +1855,11 @@ bool VoiceLabClient::StartAuthorizedRecording(const std::string& recording_id,
     archive_realtime_mode_.store(mode == "meeting_live");
     archive_realtime_gap_.store(false);
     const auto storage_path = Board::GetInstance().GetRecordingStoragePath();
-    if (!storage_path.empty()) {
+    // The TF archive and its upload contract are mono. Multi-mic evidence is a lab
+    // capture: it relies on the bounded realtime buffer and fails explicitly when full.
+    if (!storage_path.empty() && recording_channels_.load() != kAudioChannels)
+        ESP_LOGW(TAG, "Multi-channel evidence recording: TF archive not used");
+    if (!storage_path.empty() && recording_channels_.load() == kAudioChannels) {
         const bool initialized = InitializeArchive();
         archive_sample_start_ = sample_start_;
         const bool started = initialized && archive_.Begin(recording_id_, boot_id_, sample_start_);
@@ -2058,11 +2076,39 @@ void VoiceLabClient::NotifyRecordingStarted() {
         []() { Application::GetInstance().Alert("Voice Lab", "正在录音", "recording"); });
 }
 
-bool VoiceLabClient::SendPcmAudio(std::vector<int16_t>&& pcm) {
+int VoiceLabClient::CapturePlanChannels(const cJSON* capture_plan) {
+    if (capture_plan == nullptr)
+        return kAudioChannels;
+    const auto* transport = cJSON_GetObjectItem(capture_plan, "transport");
+    const auto* channels = cJSON_GetObjectItem(transport, "channels");
+    if (!cJSON_IsNumber(channels) || channels->valueint == 1)
+        return kAudioChannels;
+    if (channels->valueint == 4 &&
+        JsonText(cJSON_GetObjectItem(capture_plan, "strategy"), "four_mic_evidence") &&
+        JsonText(cJSON_GetObjectItem(transport, "layout"), "k01_mic_1_4"))
+        return 4;
+    return -1;
+}
+
+bool VoiceLabClient::SendPcmAudio(std::vector<int16_t>&& pcm, int channels) {
     if (!recording_.load()) {
         return false;
     }
-    if (pcm.empty() || pcm.size() % kPcmSamplesPerFrame != 0) {
+    const int recording_channels = recording_channels_.load();
+    if (channels != recording_channels) {
+        if (recording_channels != 1 || channels < 1) {
+            // Never upload a narrower stream under a multi-channel plan.
+            ESP_LOGE(TAG, "Capture delivered %d channels; recording requires %d", channels,
+                     recording_channels);
+            AbortRecording();
+            return false;
+        }
+        std::vector<int16_t> mono(pcm.size() / channels);
+        for (size_t i = 0; i < mono.size(); ++i)
+            mono[i] = pcm[i * channels];
+        pcm = std::move(mono);
+    }
+    if (pcm.empty() || pcm.size() % (kPcmSamplesPerFrame * recording_channels) != 0) {
         ESP_LOGW(TAG, "Drop invalid PCM frame: samples=%u", static_cast<unsigned>(pcm.size()));
         return false;
     }
@@ -2081,7 +2127,7 @@ bool VoiceLabClient::SendPcmAudio(std::vector<int16_t>&& pcm) {
             return true;
     }
     if (pending_audio_pcm_.size() + pcm.size() >
-        static_cast<size_t>(kMaxPendingPcmFrames * kPcmSamplesPerFrame)) {
+        static_cast<size_t>(kMaxPendingPcmFrames * kPcmSamplesPerFrame * recording_channels)) {
         if (archive_recording_.load()) {
             archive_.RequireManualRecovery();
             archive_realtime_gap_.store(true);
@@ -2100,7 +2146,8 @@ bool VoiceLabClient::SendPcmAudio(std::vector<int16_t>&& pcm) {
     }
     if (pending_audio_pcm_.empty())
         pending_capture_start_us_ =
-            esp_timer_get_time() - static_cast<int64_t>(pcm.size()) * 1000000 / kAudioSampleRate;
+            esp_timer_get_time() -
+            static_cast<int64_t>(pcm.size() / recording_channels) * 1000000 / kAudioSampleRate;
     if (!pending_audio_pcm_.Push(pcm.data(), pcm.size())) {
         AbortRecording();
         return false;
@@ -2221,7 +2268,9 @@ bool VoiceLabClient::FlushPendingAudioLocked() {
     if (pending_audio_pcm_.empty()) {
         return true;
     }
-    const size_t pending_frames = pending_audio_pcm_.size() / kPcmSamplesPerFrame;
+    const int channels = recording_channels_.load();
+    const size_t frame_values = static_cast<size_t>(kPcmSamplesPerFrame) * channels;
+    const size_t pending_frames = pending_audio_pcm_.size() / frame_values;
     if (audio_websocket_ == nullptr || !audio_websocket_->IsConnected()) {
         audio_connected_.store(false);
         return false;
@@ -2237,14 +2286,14 @@ bool VoiceLabClient::FlushPendingAudioLocked() {
         VoiceLabMediaPolicy::BatchFrames(pending_frames, outstanding, !recording_.load());
     if (!frames_to_send)
         return true;
-    const size_t samples_to_send = frames_to_send * kPcmSamplesPerFrame;
+    const size_t samples_to_send = frames_to_send * kPcmSamplesPerFrame;  // per channel
 
-    std::vector<int16_t> batch(samples_to_send);
-    if (!pending_audio_pcm_.Pop(batch.data(), samples_to_send)) {
+    std::vector<int16_t> batch(frames_to_send * frame_values);
+    if (!pending_audio_pcm_.Pop(batch.data(), batch.size())) {
         AbortRecording();
         return false;
     }
-    const size_t remaining_frames = pending_audio_pcm_.size() / kPcmSamplesPerFrame;
+    const size_t remaining_frames = pending_audio_pcm_.size() / frame_values;
     const uint32_t captured_at_ms = static_cast<uint32_t>(pending_capture_start_us_ / 1000);
     pending_capture_start_us_ += frames_to_send * kAudioFrameDurationMs * 1000;
     pcm_lock.unlock();
@@ -2269,7 +2318,7 @@ bool VoiceLabClient::FlushPendingAudioLocked() {
         size_t queued_after_send;
         {
             std::lock_guard<std::mutex> lock(pcm_mutex_);
-            queued_after_send = pending_audio_pcm_.size() / kPcmSamplesPerFrame;
+            queued_after_send = pending_audio_pcm_.size() / frame_values;
         }
         ESP_LOGW(TAG,
                  "Voice Lab PCM socket send delayed: elapsed_ms=%lld bytes=%u "
@@ -2287,7 +2336,7 @@ bool VoiceLabClient::FlushPendingAudioLocked() {
     }
 
     audio_frames_sent_ += frames_to_send;
-    audio_bytes_sent_ += samples_to_send * sizeof(int16_t);
+    audio_bytes_sent_ += batch.size() * sizeof(int16_t);
     auto now = static_cast<uint64_t>(esp_timer_get_time());
     if (now - last_audio_stats_us_ >= 1000000) {
         ESP_LOGI(TAG,
@@ -2343,15 +2392,17 @@ bool VoiceLabClient::RetransmitAudioLocked() {
 std::string VoiceLabClient::BuildPcmPacket(const std::vector<int16_t>& pcm, uint64_t first_sequence,
                                            uint64_t first_sample_start,
                                            uint32_t captured_at_ms) const {
-    const uint32_t samples_per_channel = static_cast<uint32_t>(pcm.size());
+    const int channels = recording_channels_.load();
+    const uint32_t samples_per_channel = static_cast<uint32_t>(pcm.size() / channels);
     const uint8_t frame_count = static_cast<uint8_t>(samples_per_channel / kPcmSamplesPerFrame);
 
     std::string packet;
     packet.reserve(kPcmPacketHeaderSize + pcm.size() * sizeof(int16_t));
     packet.append("VLA2", 4);
     packet.push_back(2);
-    packet.push_back(0);
-    packet.push_back(static_cast<char>(kAudioChannels));
+    // flags: 0x04 = four raw microphones, interleaved MIC1..MIC4 ("k01_mic_1_4").
+    packet.push_back(static_cast<char>(channels == 4 ? 0x04 : 0x00));
+    packet.push_back(static_cast<char>(channels));
     packet.push_back(static_cast<char>(frame_count));
     AppendLe64(packet, boot_id_);
     AppendLe64(packet, first_sequence);
@@ -2454,6 +2505,14 @@ void VoiceLabClient::ApplyDesiredConfig(const cJSON* root, uint32_t authorized_e
         if (recording_id.size() > 128) {
             SendConfigAck(authorized_epoch, revision, "idle", nullptr, false,
                           "invalid_recording_id");
+            return;
+        }
+        const int plan_channels = CapturePlanChannels(capture_plan);
+        if (plan_channels < 0 ||
+            plan_channels > Board::GetInstance().GetVoiceLabEvidenceChannels()) {
+            // Refuse rather than acknowledge a plan the capture source cannot honour.
+            SendConfigAck(authorized_epoch, revision, "idle", capture_plan, false,
+                          "unsupported_capture_plan");
             return;
         }
         bool started = StartAuthorizedRecording(
@@ -2632,7 +2691,7 @@ std::string VoiceLabClient::GetStatusJson() const {
     cJSON_AddBoolToObject(root, "has_enrollment_code", !GetEnrollmentCode().empty());
     cJSON_AddStringToObject(root, "audio_protocol", kAudioProtocol);
     cJSON_AddNumberToObject(root, "recording_sample_rate", kAudioSampleRate);
-    cJSON_AddNumberToObject(root, "recording_channels", kAudioChannels);
+    cJSON_AddNumberToObject(root, "recording_channels", recording_channels_.load());
     cJSON_AddNumberToObject(root, "recording_frame_duration", kAudioFrameDurationMs);
     cJSON_AddBoolToObject(root, "playback_url", true);
 
