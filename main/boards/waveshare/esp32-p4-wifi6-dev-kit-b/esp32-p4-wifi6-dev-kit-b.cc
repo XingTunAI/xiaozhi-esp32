@@ -22,6 +22,7 @@
 #include <esp_lvgl_port.h>
 #include <esp_system.h>
 #include <esp_wifi.h>
+#include <ssid_manager.h>
 #include <cstdlib>
 
 namespace {
@@ -103,7 +104,7 @@ public:
     // Supported combination, not the source of a given recording (that is latched per
     // recording and logged as "Next recording input" / "K01 capture started").
     std::string GetAudioFrontendIdentity() const override { return "p4-usb-pdm-k01-selectable"; }
-    std::string GetAudioFrontendFirmwareIdentity() const override { return "p4-mm-afe-usb-k01raw-v2"; }
+    std::string GetAudioFrontendFirmwareIdentity() const override { return "p4-mm-afe-usb-k01raw-v3"; }
     // Only the K01 source has four synchronised raw microphones to offer.
     int GetVoiceLabEvidenceChannels() const override {
         return board_audio_source.load() == kBoardSourceK01 ? 4 : 1;
@@ -118,6 +119,21 @@ public:
     bool HandleConsoleCommand(const std::string& command) override {
         if (HandleBoardScaleCommand(command))
             return true;
+        // "p4 wifi save <ssid> <password>": SSID without spaces; the password is never logged.
+        if (command.rfind("p4 wifi save ", 0) == 0) {
+            const auto rest = command.substr(13);
+            const auto space = rest.find(' ');
+            const auto ssid = rest.substr(0, space);
+            const auto password = space == std::string::npos ? std::string() : rest.substr(space + 1);
+            ESP_LOGI(TAG, "Wi-Fi save %s: %s", ssid.c_str(),
+                     RequestBoardWifiSave(ssid, password) ? "queued" : "rejected");
+            return true;
+        }
+        if (command == "p4 wifi list") {
+            for (const auto& item : SsidManager::GetInstance().GetSsidList())
+                ESP_LOGI(TAG, "Saved Wi-Fi: %s", item.ssid.c_str());
+            return true;
+        }
         // Page/button commands drive CounterDisplay and are unavailable when running headless.
         if (!display_) {
             for (const char* screen_command : {"p4 employee", "p4 ui-freeze", "p4 ui-resume",

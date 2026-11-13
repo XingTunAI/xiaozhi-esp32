@@ -1798,10 +1798,21 @@ bool VoiceLabClient::StartAuthorizedRecording(const std::string& recording_id,
 #else
             constexpr uint32_t pcm_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
 #endif
-            // Same 12 s duration budget per channel (4 channels: about 1.5 MB of PSRAM).
-            if (!pending_audio_pcm_.Allocate(
-                    kMaxPendingPcmFrames * kPcmSamplesPerFrame * recording_channels_.load(),
-                    pcm_caps)) {
+            // Same duration budget per channel; channels only scale the bytes.
+            int budget_seconds = 0;
+            for (int seconds : kPendingPcmBudgetSeconds) {
+                if (pending_audio_pcm_.Allocate(static_cast<size_t>(seconds) * kAudioSampleRate *
+                                                    recording_channels_.load(),
+                                                pcm_caps)) {
+                    budget_seconds = seconds;
+                    break;
+                }
+            }
+            if (budget_seconds > 0)
+                ESP_LOGI(TAG, "Voice Lab PCM backlog budget: %d s x %d ch (%u bytes)",
+                         budget_seconds, recording_channels_.load(),
+                         static_cast<unsigned>(pending_audio_pcm_.capacity() * sizeof(int16_t)));
+            if (budget_seconds == 0) {
                 ESP_LOGE(TAG, "Unable to allocate bounded PCM buffer; capture remains disabled");
                 CloseAudioLocked();
                 SetUserState(UserState::Error);
@@ -2126,8 +2137,7 @@ bool VoiceLabClient::SendPcmAudio(std::vector<int16_t>&& pcm, int channels) {
         if (archive_live_suspended_.load())
             return true;
     }
-    if (pending_audio_pcm_.size() + pcm.size() >
-        static_cast<size_t>(kMaxPendingPcmFrames * kPcmSamplesPerFrame * recording_channels)) {
+    if (pending_audio_pcm_.size() + pcm.size() > pending_audio_pcm_.capacity()) {
         if (archive_recording_.load()) {
             archive_.RequireManualRecovery();
             archive_realtime_gap_.store(true);

@@ -83,11 +83,12 @@ private:
     // Bound retained audio by duration, independent of variable packet sizes.
     static constexpr uint64_t kMaxUnacknowledgedSamples = kAudioSampleRate * 4;
 #if CONFIG_SPIRAM
-    // Fixed 384 KB PSRAM budget: tolerate observed multi-second transport stalls
-    // without persisting recordings or delaying the normal immediate send path.
-    static constexpr int kMaxPendingPcmFrames = 12000 / kAudioFrameDurationMs;
+    // Bounded PSRAM backlog, tried longest first. 2026-11-13: office Wi-Fi dropped the
+    // media socket for 20-30 s at a time and the former fixed 12 s budget ended
+    // four-mic recordings; 120 s x 4 channels is 15.4 MB. 12 s stays the floor.
+    static constexpr int kPendingPcmBudgetSeconds[] = {120, 60, 30, 12};
 #else
-    static constexpr int kMaxPendingPcmFrames = 1000 / kAudioFrameDurationMs;
+    static constexpr int kPendingPcmBudgetSeconds[] = {1};
 #endif
 
     bool InitializeArchive();

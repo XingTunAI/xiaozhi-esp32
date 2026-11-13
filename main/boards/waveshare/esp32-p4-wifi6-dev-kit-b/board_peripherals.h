@@ -24,6 +24,9 @@ struct BoardPeripheralStatus {
 BoardPeripheralStatus GetBoardPeripheralStatus();
 bool RequestBoardWifiScan();
 bool RequestBoardWifiConnect(const std::string& ssid, const std::string& password);
+// Saves a network without connecting (it may only exist at the test site). Boot and
+// outage recovery choose among saved networks; "voicelab-test" wins when visible.
+bool RequestBoardWifiSave(const std::string& ssid, const std::string& password);
 bool RequestBoardStorageCheck();
 
 // Callback is delivered outside the status lock on aggregate IP availability changes.

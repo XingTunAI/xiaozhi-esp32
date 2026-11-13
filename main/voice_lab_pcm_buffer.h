@@ -16,6 +16,9 @@ public:
         if (capacity == 0)
             return false;
         if (!storage_ || capacity_ != capacity) {
+            // Release first: a multi-megabyte PSRAM budget must not need old + new at once.
+            storage_.reset();
+            capacity_ = 0;
             auto* data = static_cast<int16_t*>(heap_caps_malloc(capacity * sizeof(int16_t), caps));
             if (!data)
                 return false;
@@ -28,6 +31,7 @@ public:
 
     void clear() { head_ = size_ = 0; }
     size_t size() const { return size_; }
+    size_t capacity() const { return capacity_; }
     bool empty() const { return size_ == 0; }
 
     bool Push(const int16_t* source, size_t count) {

@@ -252,6 +252,103 @@ void ConnectWifi(const BoardCommand& command, bool retry_saved = false) {
                       : (wifi_reconnect ? "连接超时，正在自动重试" : "连接失败，请检查密码或信号");
 }
 
+// Saved-network selection follows the field-proven XIAO ESP32-S3 Voice Lab firmware
+// (voice-lab-quality xiao-esp32s3-respeaker connect_wifi): scan, try saved networks in
+// RSSI order, then saved networks the scan missed (hidden SSIDs); re-select every 15 s
+// of outage. One addition (Rex, 2026-11-13): the dedicated test hotspot is tried first
+// whenever visible, and an idle device on another network moves to it.
+constexpr char kPreferredSsid[] = "voicelab-test";
+constexpr unsigned kWifiFailoverTicks = 3;     // 3 x 5 s idle ticks = S3 15 s failover
+constexpr unsigned kPreferredProbeTicks = 12;  // look for the hotspot once a minute, idle only
+
+// ESP-IDF returns scan records sorted by RSSI, strongest first.
+std::vector<std::string> ScanVisibleSsids() {
+    std::vector<std::string> visible;
+    xEventGroupClearBits(wifi_events, BIT0);
+    auto err = esp_wifi_scan_start(nullptr, false);
+    if (err == ESP_OK &&
+        !(xEventGroupWaitBits(wifi_events, BIT0, pdTRUE, pdFALSE, pdMS_TO_TICKS(15000)) & BIT0))
+        err = ESP_ERR_TIMEOUT;
+    if (err == ESP_OK) {
+        wifi_ap_record_t records[20] = {};
+        uint16_t count = 20;
+        if (esp_wifi_scan_get_ap_records(&count, records) == ESP_OK) {
+            for (unsigned i = 0; i < count; ++i) {
+                std::string ssid(reinterpret_cast<char*>(records[i].ssid),
+                                 strnlen(reinterpret_cast<char*>(records[i].ssid), 32));
+                if (!ssid.empty() && std::find(visible.begin(), visible.end(), ssid) == visible.end())
+                    visible.push_back(ssid);
+            }
+        }
+    } else {
+        ESP_LOGW(TAG, "Wi-Fi selection scan: %s", esp_err_to_name(err));
+    }
+    esp_wifi_clear_ap_list();
+    esp_wifi_scan_stop();
+    return visible;
+}
+
+bool ConnectSavedNetwork(const std::vector<SsidItem>& saved, const std::string& ssid) {
+    for (const auto& item : saved) {
+        if (item.ssid != ssid || item.ssid.size() > 32 || item.password.size() > 64)
+            continue;
+        BoardCommand connect{};
+        connect.type = 2;
+        memcpy(connect.ssid, item.ssid.data(), item.ssid.size());
+        memcpy(connect.password, item.password.data(), item.password.size());
+        ConnectWifi(connect, true);
+        memset(connect.password, 0, sizeof(connect.password));
+        return GetBoardPeripheralStatus().wifi_ip != "--";
+    }
+    return false;
+}
+
+bool ConnectBestSavedNetwork() {
+    const auto saved = SsidManager::GetInstance().GetSsidList();  // copy
+    if (saved.empty())
+        return false;
+    if (GetBoardPeripheralStatus().wifi_ip == "--")
+        esp_wifi_disconnect();  // a pending reconnect attempt would reject the scan
+    const auto visible = ScanVisibleSsids();
+    const auto is_saved = [&](const std::string& ssid) {
+        return std::any_of(saved.begin(), saved.end(),
+                           [&](const SsidItem& item) { return item.ssid == ssid; });
+    };
+    std::vector<std::string> order;
+    const auto add = [&](const std::string& ssid) {
+        if (is_saved(ssid) && std::find(order.begin(), order.end(), ssid) == order.end())
+            order.push_back(ssid);
+    };
+    if (std::find(visible.begin(), visible.end(), kPreferredSsid) != visible.end())
+        add(kPreferredSsid);
+    for (const auto& ssid : visible)
+        add(ssid);
+    for (const auto& item : saved)
+        add(item.ssid);
+    ESP_LOGI(TAG, "Wi-Fi selection: %u saved, %u visible, first=%s",
+             static_cast<unsigned>(saved.size()), static_cast<unsigned>(visible.size()),
+             order.front().c_str());
+    for (const auto& ssid : order) {
+        if (ConnectSavedNetwork(saved, ssid))
+            return true;
+    }
+    ESP_LOGW(TAG, "No saved Wi-Fi is reachable");
+    return false;
+}
+
+void ProbePreferredNetwork() {
+    const auto saved = SsidManager::GetInstance().GetSsidList();
+    if (std::none_of(saved.begin(), saved.end(),
+                     [](const SsidItem& item) { return item.ssid == kPreferredSsid; }))
+        return;
+    const auto visible = ScanVisibleSsids();
+    if (std::find(visible.begin(), visible.end(), kPreferredSsid) == visible.end())
+        return;
+    ESP_LOGI(TAG, "Preferred Wi-Fi %s visible; switching while idle", kPreferredSsid);
+    if (!ConnectSavedNetwork(saved, kPreferredSsid))
+        ConnectBestSavedNetwork();
+}
+
 void EthernetEvent(void*, esp_event_base_t base, int32_t id, void* data) {
     if (base == IP_EVENT && id == IP_EVENT_ETH_GOT_IP) {
         const auto* event = static_cast<ip_event_got_ip_t*>(data);
@@ -730,18 +827,7 @@ void Initialize(void*) {
     err = InitializeWifi();
     if (err == ESP_OK) {
         CheckWifiRadio();
-        const auto saved = SsidManager::GetInstance().GetSsidList();
-        if (!saved.empty()) {
-            BoardCommand connect{};
-            connect.type = 2;
-            if (saved.front().ssid.size() <= 32 && saved.front().password.size() <= 64) {
-                memcpy(connect.ssid, saved.front().ssid.c_str(), saved.front().ssid.size());
-                memcpy(connect.password, saved.front().password.c_str(),
-                       saved.front().password.size());
-                ConnectWifi(connect, true);
-                memset(connect.password, 0, sizeof(connect.password));
-            }
-        }
+        ConnectBestSavedNetwork();
     } else {
         std::lock_guard<std::mutex> lock(status_mutex);
         status.wifi = "初始化失败";
@@ -749,14 +835,33 @@ void Initialize(void*) {
     BoardCommand command{};
     LogResources("network-init");
     unsigned idle_ticks = 0;
+    unsigned wifi_offline_ticks = 0;
+    unsigned preferred_probe_ticks = 0;
     while (true) {
         if (xQueueReceive(commands, &command, pdMS_TO_TICKS(5000)) != pdTRUE) {
             LogWifiLink();
             if (++idle_ticks % 6 == 0)
                 LogResources("running");
-            if (wifi_reconnect && GetBoardPeripheralStatus().wifi_ip == "--") {
-                const auto retry = esp_wifi_connect();
-                ESP_LOGI(TAG, "Wi-Fi reconnect requested: %s", esp_err_to_name(retry));
+            const auto wifi = GetBoardPeripheralStatus();
+            if (wifi_reconnect && wifi.wifi_ip == "--") {
+                preferred_probe_ticks = 0;
+                if (++wifi_offline_ticks >= kWifiFailoverTicks) {
+                    wifi_offline_ticks = 0;
+                    ESP_LOGW(TAG, "Wi-Fi outage: re-selecting among saved networks");
+                    ConnectBestSavedNetwork();
+                } else {
+                    const auto retry = esp_wifi_connect();
+                    ESP_LOGI(TAG, "Wi-Fi reconnect requested: %s", esp_err_to_name(retry));
+                }
+            } else {
+                wifi_offline_ticks = 0;
+                // Never scan off-channel during a recording; switch networks only when idle.
+                if (wifi.wifi_ip != "--" && wifi.wifi_ssid != kPreferredSsid &&
+                    ++preferred_probe_ticks >= kPreferredProbeTicks) {
+                    preferred_probe_ticks = 0;
+                    if (!VoiceLabClient::GetInstance().IsRecording())
+                        ProbePreferredNetwork();
+                }
             }
             continue;
         }
@@ -768,6 +873,12 @@ void Initialize(void*) {
             RecoverSdCard();
         else if (command.type == 4)
             UpdateC6Firmware(command.update_url);
+        else if (command.type == 5) {
+            // Save only: the network (e.g. a hotspot at the test site) may not exist yet.
+            SsidManager::GetInstance().AddSsid(command.ssid, command.password);
+            ESP_LOGI(TAG, "Wi-Fi saved: %s (password %u chars)", command.ssid,
+                     static_cast<unsigned>(strlen(command.password)));
+        }
         memset(command.password, 0, sizeof(command.password));
     }
 }
@@ -804,6 +915,19 @@ bool RequestBoardWifiConnect(const std::string& ssid, const std::string& passwor
         return false;
     BoardCommand command{};
     command.type = 2;
+    memcpy(command.ssid, ssid.data(), ssid.size());
+    memcpy(command.password, password.data(), password.size());
+    const bool queued = xQueueSend(commands, &command, 0) == pdTRUE;
+    memset(command.password, 0, sizeof(command.password));
+    return queued;
+}
+
+bool RequestBoardWifiSave(const std::string& ssid, const std::string& password) {
+    if (!commands || ssid.empty() || ssid.size() > 32 || password.size() > 64 ||
+        (!password.empty() && password.size() < 8))
+        return false;
+    BoardCommand command{};
+    command.type = 5;
     memcpy(command.ssid, ssid.data(), ssid.size());
     memcpy(command.password, password.data(), password.size());
     const bool queued = xQueueSend(commands, &command, 0) == pdTRUE;
