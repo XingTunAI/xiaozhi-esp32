@@ -7,6 +7,7 @@
 #include "counter_display.h"
 #include "display/lcd_display.h"
 #include "lcd_init_cmds.h"
+#include "net_diag.h"
 #include "usb_capture_codec.h"
 #include "voice_lab_client.h"
 #include "wifi_board.h"
@@ -104,7 +105,9 @@ public:
     // Supported combination, not the source of a given recording (that is latched per
     // recording and logged as "Next recording input" / "K01 capture started").
     std::string GetAudioFrontendIdentity() const override { return "p4-usb-pdm-k01-selectable"; }
-    std::string GetAudioFrontendFirmwareIdentity() const override { return "p4-mm-afe-usb-k01raw-v3"; }
+    std::string GetAudioFrontendFirmwareIdentity() const override {
+        return "p4-mm-afe-usb-k01raw-v3-netdiag";
+    }
     // Only the K01 source has four synchronised raw microphones to offer.
     int GetVoiceLabEvidenceChannels() const override {
         return board_audio_source.load() == kBoardSourceK01 ? 4 : 1;
@@ -117,7 +120,7 @@ public:
     }
 
     bool HandleConsoleCommand(const std::string& command) override {
-        if (HandleBoardScaleCommand(command))
+        if (HandleBoardScaleCommand(command) || HandleBoardNetDiagCommand(command))
             return true;
         // "p4 wifi save <ssid> <password>": SSID without spaces; the password is never logged.
         if (command.rfind("p4 wifi save ", 0) == 0) {
